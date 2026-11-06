@@ -55,6 +55,7 @@ Panel {
 
   // UI Accordion States
   property bool showGestures: false
+  property var pendingArgs: null
 
   readonly property string ctlBin: Qt.resolvedUrl("bin/redmictl").toString().replace(/^file:\/\//, "")
   readonly property color fgColor: bar ? bar.foreground : Commons.Color.foreground
@@ -127,7 +128,13 @@ Panel {
   }
 
   function runCtl(args) {
-    if (ctlProc.running) return;
+    var isBgState = (args.length === 1 && args[0] === "state");
+    if (ctlProc.running) {
+      if (!isBgState) {
+        panel.pendingArgs = args;
+      }
+      return;
+    }
     ctlProc.command = [panel.ctlBin].concat(args);
     ctlProc.running = true;
   }
@@ -147,18 +154,23 @@ Panel {
   }
 
   function setAncLevel(level) {
+    panel.anc = "anc";
     panel.ancLevel = level;
     panel.adaptiveAnc = false;
     runCtl(["anc-level", level]);
   }
 
   function setTransLevel(level) {
+    panel.anc = "transparency";
     panel.transLevel = level;
     runCtl(["trans-level", level]);
   }
 
   function setAdaptiveAnc(enabled) {
     panel.adaptiveAnc = enabled;
+    if (!enabled && panel.ancLevel === "adaptive") {
+      panel.ancLevel = "balanced";
+    }
     runCtl(["adaptive-anc", enabled ? "on" : "off"]);
   }
 
@@ -216,12 +228,24 @@ Panel {
     id: ctlProc
     command: [panel.ctlBin, "state"]
     stdout: StdioCollector {
-      onStreamFinished: panel.applyState(text)
+      onStreamFinished: {
+        if (panel.pendingArgs === null) {
+          panel.applyState(text);
+        }
+      }
+    }
+    onExited: {
+      if (panel.pendingArgs !== null) {
+        var next = panel.pendingArgs;
+        panel.pendingArgs = null;
+        ctlProc.command = [panel.ctlBin].concat(next);
+        ctlProc.running = true;
+      }
     }
   }
 
   Timer {
-    interval: panel.opened ? 3000 : 8000
+    interval: panel.opened ? 1200 : 2500
     running: true
     repeat: true
     triggeredOnStart: true

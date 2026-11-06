@@ -183,6 +183,34 @@ class TestRcspProtocolAndCommands(unittest.TestCase):
         self.assertEqual(status["anc"], "anc")
         self.assertEqual(status["anc_level"], "deep")
 
+    def test_rcsp_zero_flag_response_and_bitmask_device_info(self) -> None:
+        # Hardware responses with flags=0x00 must be recognized as responses (bit 7 == 0)
+        raw_f3_resp = bytes.fromhex("fedcba00f30007000104000b0102ef")
+        pkt = protocol.parse_frame(raw_f3_resp)
+        self.assertIsNotNone(pkt)
+        assert pkt is not None
+        self.assertTrue(pkt.is_response)
+        self.assertFalse(pkt.is_request_or_notify)
+        self.assertEqual(pkt.status, 0x00)
+        self.assertEqual(pkt.seq, 0x01)
+        self.assertEqual(pkt.payload, bytes.fromhex("04000b0102"))
+        cfg = protocol.parse_config_records(pkt.payload)
+        self.assertEqual(cfg["anc"], "anc")
+        self.assertEqual(cfg["anc_level"], "deep")
+        self.assertFalse(cfg["adaptive_anc"])
+
+        # Bitmask query for battery (bit 7 = 0x80) and ANC (bit 4 = 0x10)
+        mask_batt = protocol.parse_frame(protocol.build_get_device_info_mask(3, protocol.DEV_INFO_BIT_BATTERY))
+        assert mask_batt is not None
+        self.assertEqual(mask_batt.payload, b"\x00\x00\x00\x80")
+
+        # Hardware response for mask 4 (ANC mode = Transparency 0x02) and mask 7 (Battery 90% in slot 1)
+        dev_anc = protocol.parse_device_info_tlvs(bytes.fromhex("020402"))
+        self.assertEqual(dev_anc["anc"], "transparency")
+        dev_batt = protocol.parse_device_info_tlvs(bytes.fromhex("0407ff5aff"))
+        self.assertEqual(dev_batt["battery"], 90)
+        self.assertFalse(dev_batt["charging"])
+
     def test_live_redmi_neo_manufacturer_data_parsing(self) -> None:
         # Exact ManufacturerData captured from user's REDMI Headphones Neo (A0:90:B5:F8:E2:A7)
         mfg = {

@@ -72,9 +72,20 @@ CFG_EQ_PRESET = 0x07
 CFG_FIND_DEVICE = 0x09
 CFG_ANC_CYCLE = 0x0A
 CFG_EFFECT_STRENGTH = 0x0B
+CFG_IN_EAR = 0x0C
 CFG_ADAPTIVE_ANC = 0x25
+CFG_SERIAL_NUMBER = 0x27
 CFG_GAME_MODE = 0x2F
 CFG_EQ_CURVE = 0x37
+
+# Device Info Bitmask Indices (OP_GET_DEVICE_INFO 0x02: payload = 1 << bit in 4-byte BE)
+DEV_INFO_BIT_NAME = 0
+DEV_INFO_BIT_FIRMWARE = 1
+DEV_INFO_BIT_SINGLE_BATTERY = 2
+DEV_INFO_BIT_VID_PID = 3
+DEV_INFO_BIT_ANC = 4
+DEV_INFO_BIT_UBOOT = 6
+DEV_INFO_BIT_BATTERY = 7
 
 # ANC Modes (OP_ANC sub-op 0x04 / RUN_INFO TLV 0x09 / REPORT_STATUS TLV 0x04)
 ANC_MODE_TO_BYTE = {
@@ -290,11 +301,11 @@ class RcspPacket:
 
     @property
     def is_response(self) -> bool:
-        return self.flags == FLAG_RESPONSE
+        return (self.flags & 0x80) == 0
 
     @property
     def is_request_or_notify(self) -> bool:
-        return self.flags != FLAG_RESPONSE
+        return (self.flags & 0x80) != 0
 
     @property
     def expects_ack(self) -> bool:
@@ -447,8 +458,13 @@ class CommandAuthSession:
 
 # ── Command Builders ──
 
-def build_get_device_info(seq: int) -> bytes:
-    return build_request(OP_GET_DEVICE_INFO, seq, b"\xFF\xFF\xFF\xFF")
+def build_get_device_info(seq: int, mask: int = 0xFFFFFFFF) -> bytes:
+    return build_request(OP_GET_DEVICE_INFO, seq, struct.pack(">I", mask & 0xFFFFFFFF))
+
+
+def build_get_device_info_mask(seq: int, bit: int) -> bytes:
+    """Builds a single-attribute OP_GET_DEVICE_INFO (0x02) request using 1 << bit."""
+    return build_get_device_info(seq, 1 << (bit & 31))
 
 
 def build_get_run_info(seq: int) -> bytes:
@@ -459,6 +475,13 @@ def build_set_anc_mode(seq: int, mode: str) -> bytes:
     if mode not in ANC_MODE_TO_BYTE:
         raise ValueError(f"Unknown ANC mode: {mode}")
     return build_request(OP_ANC, seq, bytes([0x02, 0x04, ANC_MODE_TO_BYTE[mode]]))
+
+
+def build_set_anc_effect(seq: int, mode: str, sub_byte: int = 0x00) -> bytes:
+    """Sets ANC mode + sub-mode via CFG_EFFECT_STRENGTH (0xF2 / 0x000B)."""
+    if mode not in ANC_MODE_TO_BYTE:
+        raise ValueError(f"Unknown ANC mode: {mode}")
+    return build_set_config(seq, CFG_EFFECT_STRENGTH, bytes([ANC_MODE_TO_BYTE[mode], sub_byte & 0xFF]))
 
 
 def build_set_ear_detection(seq: int, enabled: bool) -> bytes:
@@ -656,10 +679,18 @@ def parse_device_info_tlvs(payload: bytes) -> dict[str, Any]:
         elif tlv_type == 0x01 and len(val) >= 2:
             b0, b1 = val[0], val[1]
             info["firmware"] = f"{(b0 >> 4) & 0xF}.{b0 & 0xF}.{(b1 >> 4) & 0xF}.{b1 & 0xF}"
+        elif tlv_type == 0x02 and val:
+            batt = parse_battery_bytes(val[:1])
+            for k, v in batt.items():
+                info.setdefault(k, v)
         elif tlv_type == 0x03 and len(val) >= 4:
             vid, pid = struct.unpack(">HH", val[:4])
             info["vid"] = f"{vid:04x}"
             info["pid"] = f"{pid:04x}"
+        elif tlv_type == 0x04 and len(val) >= 1:
+            mode = BYTE_TO_ANC_MODE.get(val[0])
+            if mode:
+                info["anc"] = mode
         elif tlv_type == 0x07 and val:
             info.update(parse_battery_bytes(val))
     return info
@@ -750,12 +781,21 @@ def parse_config_records(payload: bytes) -> dict[str, Any]:
                 if strength == 0x03:
                     updates["adaptive_anc"] = True
                 elif strength in BYTE_TO_ANC_LEVEL:
+                    updates["adaptive_anc"] = False
                     updates["anc_level"] = BYTE_TO_ANC_LEVEL[strength]
             elif target == 0x02 and strength in BYTE_TO_TRANS_LEVEL:
                 updates["trans_level"] = BYTE_TO_TRANS_LEVEL[strength]
 
         elif cfg_id == CFG_ADAPTIVE_ANC and len(val) >= 1:
             updates["adaptive_anc"] = val[0] == 0x01
+
+        elif cfg_id == CFG_SERIAL_NUMBER and val:
+            try:
+                sn = val.decode("utf-8", errors="ignore").strip("\x00").strip()
+                if sn:
+                    updates["serial_number"] = sn
+            except Exception:
+                pass
 
         elif cfg_id == CFG_GAME_MODE and len(val) >= 1:
             updates["game_mode"] = val[0] == 0x01

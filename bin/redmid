@@ -430,6 +430,8 @@ class RedmiNeoDaemon:
         self._connecting_rfcomm = False
         self._last_rfcomm_attempt = 0.0
         self._last_codec_check = 0.0
+        self._last_write_seq: int | None = None
+        self._last_write_ts = 0.0
         self._stop_event = threading.Event()
 
         # Initialize state from persisted config so the UI always has rich context
@@ -603,7 +605,7 @@ class RedmiNeoDaemon:
                     if (
                         self._rfcomm_sock is None
                         and not self._connecting_rfcomm
-                        and (now - self._last_rfcomm_attempt > 3.0)
+                        and (now - self._last_rfcomm_attempt > 1.5)
                     ):
                         self._last_rfcomm_attempt = now
                         self._connecting_rfcomm = True
@@ -634,46 +636,47 @@ class RedmiNeoDaemon:
                 pass
 
     def _resolve_rfcomm_candidates(self, mac: str) -> tuple[list[int], int | None]:
+        """Resolves RFCOMM candidate channels exclusively for the Xiaomi RCSP/MMA control service."""
         channels: list[int] = []
-        rcsp_ch = sdp_find_rfcomm_channel(mac, protocol.UUID_MIUI_SPP)
-        if rcsp_ch:
-            channels.append(rcsp_ch)
-        fp_ch = sdp_find_rfcomm_channel(mac, protocol.UUID_FASTPAIR_STREAM)
-        if not fp_ch:
-            fp_ch = sdp_find_rfcomm_channel(mac, protocol.UUID_FASTPAIR_FE2C)
-        if fp_ch and fp_ch not in channels:
-            channels.append(fp_ch)
-        for uuid_str in protocol.SERVICE_UUID_PRIORITY:
+        for uuid_str in (
+            protocol.UUID_MIUI_SPP,
+            protocol.UUID_XIAOMI_MMA,
+            protocol.UUID_VENDOR_SPEC,
+        ):
             ch = sdp_find_rfcomm_channel(mac, uuid_str)
             if ch and ch not in channels:
                 channels.append(ch)
-        for fallback in (6, 5, 24, 8, 1):
+        for fallback in (6, 24):
             if fallback not in channels:
                 channels.append(fallback)
-        return channels, (fp_ch or 5)
+        return channels, None
 
     def _connect_rfcomm_worker(self, mac: str) -> None:
         try:
-            candidates, fp_channel = self._resolve_rfcomm_candidates(mac)
+            candidates, _ = self._resolve_rfcomm_candidates(mac)
             connected_sock: socket.socket | None = None
             used_channel: int | None = None
 
-            for ch in candidates:
-                with self._lock:
-                    if not self.state.get("connected") or self._stop_event.is_set():
-                        return
-                s = socket.socket(socket.AF_BLUETOOTH, socket.SOCK_STREAM, socket.BTPROTO_RFCOMM)
-                s.settimeout(2.2)
-                try:
-                    s.connect((mac, ch))
-                    connected_sock = s
-                    used_channel = ch
-                    break
-                except OSError:
+            for attempt in range(3):
+                for ch in candidates:
+                    with self._lock:
+                        if not self.state.get("connected") or self._stop_event.is_set():
+                            return
+                    s = socket.socket(socket.AF_BLUETOOTH, socket.SOCK_STREAM, socket.BTPROTO_RFCOMM)
+                    s.settimeout(2.2)
                     try:
-                        s.close()
-                    except Exception:
-                        pass
+                        s.connect((mac, ch))
+                        connected_sock = s
+                        used_channel = ch
+                        break
+                    except OSError:
+                        try:
+                            s.close()
+                        except Exception:
+                            pass
+                if connected_sock is not None:
+                    break
+                time.sleep(0.35)
 
             if connected_sock is None:
                 return
@@ -682,17 +685,43 @@ class RedmiNeoDaemon:
                 self._rfcomm_sock = connected_sock
                 self._rfcomm_mac = mac
                 self._rfcomm_channel = used_channel
-                self._rfcomm_is_fastpair = used_channel == fp_channel
-                self.state["rcsp_connected"] = True
+                self._rfcomm_is_fastpair = False
                 self.state["error"] = None
 
-            # Perform SAFER+ authentication handshake + RCSP / Fast Pair stream session
-            self._run_rcsp_session(connected_sock, is_fastpair=(used_channel == fp_channel))
+            # Perform SAFER+ authentication handshake + RCSP stream session
+            self._run_rcsp_session(connected_sock, is_fastpair=False)
         except Exception:
             pass
         finally:
             with self._lock:
                 self._connecting_rfcomm = False
+
+    def _ensure_rcsp_ready(self, timeout: float = 1.5) -> bool:
+        """Ensures the RCSP RFCOMM session is connected and authenticated before sending commands."""
+        with self._lock:
+            if self._rfcomm_sock is not None and self._rfcomm_authenticated:
+                return True
+            connected = bool(self.state.get("connected"))
+            mac = str(self.state.get("mac") or "").strip().upper()
+            if not connected or not mac:
+                return False
+            if self._rfcomm_sock is None and not self._connecting_rfcomm:
+                self._last_rfcomm_attempt = time.monotonic()
+                self._connecting_rfcomm = True
+                threading.Thread(
+                    target=self._connect_rfcomm_worker,
+                    args=(mac,),
+                    daemon=True,
+                ).start()
+
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            with self._lock:
+                if self._rfcomm_sock is not None and self._rfcomm_authenticated:
+                    return True
+            time.sleep(0.05)
+        with self._lock:
+            return self._rfcomm_sock is not None
 
     def _send_raw(self, data: bytes) -> bool:
         with self._lock:
@@ -706,13 +735,26 @@ class RedmiNeoDaemon:
             self._close_rfcomm()
             return False
 
+    def _query_live_status(self) -> None:
+        """Sends lightweight real-time status queries (ANC mode/level + battery)."""
+        frames = [
+            protocol.build_get_config(self._next_seq(), protocol.CFG_EFFECT_STRENGTH),
+            protocol.build_get_device_info_mask(self._next_seq(), protocol.DEV_INFO_BIT_ANC),
+            protocol.build_get_device_info_mask(self._next_seq(), protocol.DEV_INFO_BIT_BATTERY),
+        ]
+        for frame in frames:
+            if not self._send_raw(frame):
+                break
+            time.sleep(0.02)
+
     def _query_initial_device_state(self) -> None:
         """Sends initial RCSP queries after connecting/authenticating."""
         frames = [
-            protocol.build_get_device_info(self._next_seq()),
-            protocol.build_get_run_info(self._next_seq()),
+            protocol.build_get_device_info_mask(self._next_seq(), protocol.DEV_INFO_BIT_BATTERY),
+            protocol.build_get_device_info_mask(self._next_seq(), protocol.DEV_INFO_BIT_ANC),
+            protocol.build_get_device_info_mask(self._next_seq(), protocol.DEV_INFO_BIT_FIRMWARE),
+            protocol.build_get_device_info_mask(self._next_seq(), protocol.DEV_INFO_BIT_VID_PID),
             protocol.build_get_config(self._next_seq(), protocol.CFG_EFFECT_STRENGTH),
-            protocol.build_get_config(self._next_seq(), protocol.CFG_ADAPTIVE_ANC),
             protocol.build_get_config(self._next_seq(), protocol.CFG_EQ_PRESET),
             protocol.build_get_config(self._next_seq(), protocol.CFG_EQ_CURVE),
             protocol.build_get_config(self._next_seq(), protocol.CFG_MULTIPOINT),
@@ -724,12 +766,14 @@ class RedmiNeoDaemon:
         for frame in frames:
             if not self._send_raw(frame):
                 break
-            time.sleep(0.03)
+            time.sleep(0.025)
 
     def _apply_parsed_updates(self, updates: dict[str, Any], from_rcsp: bool = True) -> None:
         if not updates:
             return
         with self._lock:
+            if from_rcsp:
+                self.state["rcsp_connected"] = True
             for k, v in updates.items():
                 if k == "gestures" and isinstance(v, dict):
                     merged = dict(self.state.get("gestures") or DEFAULT_GESTURES)
@@ -741,6 +785,21 @@ class RedmiNeoDaemon:
                 self.state["battery_source"] = "rcsp"
         self._persist_state()
 
+    def _mark_write_seq(self) -> int:
+        with self._lock:
+            seq = self._next_seq()
+            self._last_write_seq = seq
+            self._last_write_ts = time.monotonic()
+            return seq
+
+    def _is_stale_response(self, pkt: protocol.RcspPacket) -> bool:
+        with self._lock:
+            last_w = self._last_write_seq
+            if last_w is None or pkt.seq is None:
+                return False
+            diff = (last_w - pkt.seq) & 0xFF
+            return 0 <= diff < 128
+
     def _handle_rcsp_packet(self, pkt: protocol.RcspPacket, auth: protocol.CommandAuthSession) -> None:
         # 1. Handle SAFER+ mutual authentication packets (0x50 / 0x51)
         if pkt.opcode in (protocol.OP_AUTH_CHALLENGE, protocol.OP_AUTH_CONFIRM):
@@ -748,13 +807,19 @@ class RedmiNeoDaemon:
             for rep in replies:
                 self._send_raw(rep)
             if auth.authenticated and not self._rfcomm_authenticated:
-                self._rfcomm_authenticated = True
+                with self._lock:
+                    self._rfcomm_authenticated = True
+                    self.state["rcsp_connected"] = True
                 self._query_initial_device_state()
             return
 
         # 2. Acknowledge device-initiated requests/notifications if required
         if pkt.expects_ack and pkt.seq is not None:
             self._send_raw(protocol.build_response(pkt.opcode, pkt.seq))
+
+        # Ignore read responses that were requested prior to the latest user write command
+        if pkt.is_response and self._is_stale_response(pkt):
+            return
 
         # 3. Parse payload by opcode
         if pkt.opcode == protocol.OP_GET_DEVICE_INFO and pkt.is_response:
@@ -778,6 +843,7 @@ class RedmiNeoDaemon:
         fp_parser = protocol.FastPairStreamParser()
         with self._lock:
             self._seq = 0
+            self._last_write_seq = None
         auth = protocol.CommandAuthSession(self._next_seq)
 
         if not is_fastpair:
@@ -786,6 +852,7 @@ class RedmiNeoDaemon:
         sock.settimeout(1.2)
         queried_fallback = is_fastpair
         start_ts = time.monotonic()
+        last_live_poll = start_ts
 
         try:
             while not self._stop_event.is_set():
@@ -806,10 +873,16 @@ class RedmiNeoDaemon:
                         for pkt in parser.feed(chunk):
                             self._handle_rcsp_packet(pkt, auth)
                 except socket.timeout:
-                    if not self._rfcomm_authenticated and not queried_fallback and (time.monotonic() - start_ts >= 1.0):
+                    now = time.monotonic()
+                    if not self._rfcomm_authenticated and not queried_fallback and (now - start_ts >= 1.0):
                         queried_fallback = True
                         self._query_initial_device_state()
-                        sock.settimeout(5.0)
+                        sock.settimeout(2.0)
+                    elif self._rfcomm_authenticated:
+                        sock.settimeout(2.0)
+                        if (now - last_live_poll >= 2.5) and (now - self._last_write_ts >= 1.5):
+                            last_live_poll = now
+                            self._query_live_status()
                     elif is_fastpair:
                         sock.settimeout(5.0)
                     continue
@@ -832,9 +905,9 @@ class RedmiNeoDaemon:
 
         if cmd == "poll":
             self.refresh_bluez(force_codec=True)
-            if self._rfcomm_sock is not None:
+            if self._ensure_rcsp_ready(timeout=1.2):
                 self._query_initial_device_state()
-                time.sleep(0.15)
+                time.sleep(0.25)
             with self._lock:
                 return dict(self.state)
 
@@ -873,6 +946,8 @@ class RedmiNeoDaemon:
             ok, err = bluez_connect_device(mac, want_connect)
             time.sleep(0.4)
             self.refresh_bluez(force_codec=True)
+            if want_connect and ok:
+                self._ensure_rcsp_ready(timeout=1.5)
             with self._lock:
                 self.state["connecting"] = False
                 if not ok and err:
@@ -885,7 +960,15 @@ class RedmiNeoDaemon:
                 with self._lock:
                     self.state["anc"] = mode
                     self.state["error"] = None
-                self._send_raw(protocol.build_set_anc_mode(self._next_seq(), mode))
+                    anc_lvl = str(self.state.get("anc_level") or "balanced")
+                    adaptive = bool(self.state.get("adaptive_anc"))
+                if self._ensure_rcsp_ready():
+                    self._send_raw(protocol.build_set_anc_mode(self._mark_write_seq(), mode))
+                    if mode == "anc":
+                        time.sleep(0.04)
+                        eff_lvl = "adaptive" if adaptive else (anc_lvl if anc_lvl in protocol.ANC_LEVEL_TO_BYTE else "balanced")
+                        self._send_raw(protocol.build_set_anc_level(self._mark_write_seq(), eff_lvl))
+                    time.sleep(0.06)
                 self._persist_state()
             with self._lock:
                 return dict(self.state)
@@ -894,11 +977,17 @@ class RedmiNeoDaemon:
             level = str(req.get("level") or "").lower()
             if level in protocol.ANC_LEVEL_TO_BYTE:
                 with self._lock:
+                    need_anc_mode = self.state.get("anc") != "anc"
+                    self.state["anc"] = "anc"
                     self.state["anc_level"] = level
-                    if level != "adaptive":
-                        self.state["adaptive_anc"] = False
+                    self.state["adaptive_anc"] = (level == "adaptive")
                     self.state["error"] = None
-                self._send_raw(protocol.build_set_anc_level(self._next_seq(), level))
+                if self._ensure_rcsp_ready():
+                    if need_anc_mode:
+                        self._send_raw(protocol.build_set_anc_mode(self._mark_write_seq(), "anc"))
+                        time.sleep(0.05)
+                    self._send_raw(protocol.build_set_anc_level(self._mark_write_seq(), level))
+                    time.sleep(0.06)
                 self._persist_state()
             with self._lock:
                 return dict(self.state)
@@ -907,9 +996,16 @@ class RedmiNeoDaemon:
             level = str(req.get("level") or "").lower()
             if level in protocol.TRANS_LEVEL_TO_BYTE:
                 with self._lock:
+                    need_trans_mode = self.state.get("anc") != "transparency"
+                    self.state["anc"] = "transparency"
                     self.state["trans_level"] = level
                     self.state["error"] = None
-                self._send_raw(protocol.build_set_trans_level(self._next_seq(), level))
+                if self._ensure_rcsp_ready():
+                    if need_trans_mode:
+                        self._send_raw(protocol.build_set_anc_mode(self._mark_write_seq(), "transparency"))
+                        time.sleep(0.05)
+                    self._send_raw(protocol.build_set_trans_level(self._mark_write_seq(), level))
+                    time.sleep(0.06)
                 self._persist_state()
             with self._lock:
                 return dict(self.state)
@@ -917,16 +1013,25 @@ class RedmiNeoDaemon:
         if cmd == "adaptive-anc":
             enabled = bool(req.get("enabled"))
             with self._lock:
+                need_anc_mode = self.state.get("anc") != "anc"
+                if need_anc_mode and enabled:
+                    self.state["anc"] = "anc"
                 self.state["adaptive_anc"] = enabled
-                self.state["error"] = None
-            self._send_raw(protocol.build_set_adaptive_anc(self._next_seq(), enabled))
-            if enabled:
-                self._send_raw(protocol.build_set_anc_level(self._next_seq(), "adaptive"))
-            else:
                 lvl = str(self.state.get("anc_level") or "balanced")
-                if lvl == "adaptive":
+                if not enabled and lvl == "adaptive":
                     lvl = "balanced"
-                self._send_raw(protocol.build_set_anc_level(self._next_seq(), lvl))
+                    self.state["anc_level"] = lvl
+                self.state["error"] = None
+            if self._ensure_rcsp_ready():
+                if need_anc_mode and enabled:
+                    self._send_raw(protocol.build_set_anc_mode(self._mark_write_seq(), "anc"))
+                    time.sleep(0.05)
+                self._send_raw(protocol.build_set_adaptive_anc(self._mark_write_seq(), enabled))
+                if enabled:
+                    self._send_raw(protocol.build_set_anc_level(self._mark_write_seq(), "adaptive"))
+                else:
+                    self._send_raw(protocol.build_set_anc_level(self._mark_write_seq(), lvl))
+                time.sleep(0.06)
             self._persist_state()
             with self._lock:
                 return dict(self.state)
@@ -937,11 +1042,13 @@ class RedmiNeoDaemon:
                 with self._lock:
                     self.state["eq"] = preset
                     self.state["error"] = None
-                self._send_raw(protocol.build_set_eq_preset(self._next_seq(), preset))
-                if preset == "custom":
-                    with self._lock:
-                        bands = list(self.state.get("eq_bands") or [0] * 10)
-                    self._send_raw(protocol.build_set_eq_curve(self._next_seq(), bands))
+                if self._ensure_rcsp_ready():
+                    self._send_raw(protocol.build_set_eq_preset(self._mark_write_seq(), preset))
+                    if preset == "custom":
+                        with self._lock:
+                            bands = list(self.state.get("eq_bands") or [0] * 10)
+                        self._send_raw(protocol.build_set_eq_curve(self._mark_write_seq(), bands))
+                    time.sleep(0.05)
                 self._persist_state()
             with self._lock:
                 return dict(self.state)
@@ -954,8 +1061,9 @@ class RedmiNeoDaemon:
                     self.state["eq_bands"] = bands
                     self.state["eq"] = "custom"
                     self.state["error"] = None
-                self._send_raw(protocol.build_set_eq_preset(self._next_seq(), "custom"))
-                self._send_raw(protocol.build_set_eq_curve(self._next_seq(), bands))
+                if self._ensure_rcsp_ready():
+                    self._send_raw(protocol.build_set_eq_preset(self._mark_write_seq(), "custom"))
+                    self._send_raw(protocol.build_set_eq_curve(self._mark_write_seq(), bands))
                 self._persist_state()
             with self._lock:
                 return dict(self.state)
@@ -965,8 +1073,8 @@ class RedmiNeoDaemon:
             with self._lock:
                 self.state["eq_bands"] = bands
                 self.state["error"] = None
-            if not self._rfcomm_is_fastpair:
-                self._send_raw(protocol.build_eq_reset(self._next_seq()))
+            if self._ensure_rcsp_ready() and not self._rfcomm_is_fastpair:
+                self._send_raw(protocol.build_eq_reset(self._mark_write_seq()))
             self._persist_state()
             with self._lock:
                 return dict(self.state)
@@ -976,7 +1084,9 @@ class RedmiNeoDaemon:
             with self._lock:
                 self.state["multipoint"] = enabled
                 self.state["error"] = None
-            self._send_raw(protocol.build_set_multipoint(self._next_seq(), enabled))
+            if self._ensure_rcsp_ready():
+                self._send_raw(protocol.build_set_multipoint(self._mark_write_seq(), enabled))
+                time.sleep(0.05)
             self._persist_state()
             with self._lock:
                 return dict(self.state)
@@ -986,7 +1096,9 @@ class RedmiNeoDaemon:
             with self._lock:
                 self.state["game_mode"] = enabled
                 self.state["error"] = None
-            self._send_raw(protocol.build_set_game_mode(self._next_seq(), enabled))
+            if self._ensure_rcsp_ready():
+                self._send_raw(protocol.build_set_game_mode(self._mark_write_seq(), enabled))
+                time.sleep(0.05)
             self._persist_state()
             with self._lock:
                 return dict(self.state)
@@ -996,7 +1108,9 @@ class RedmiNeoDaemon:
             with self._lock:
                 self.state["auto_answer"] = enabled
                 self.state["error"] = None
-            self._send_raw(protocol.build_set_auto_answer(self._next_seq(), enabled))
+            if self._ensure_rcsp_ready():
+                self._send_raw(protocol.build_set_auto_answer(self._mark_write_seq(), enabled))
+                time.sleep(0.05)
             self._persist_state()
             with self._lock:
                 return dict(self.state)
@@ -1006,7 +1120,8 @@ class RedmiNeoDaemon:
             with self._lock:
                 self.state["ear_detection"] = enabled
                 self.state["error"] = None
-            self._send_raw(protocol.build_set_ear_detection(self._next_seq(), enabled))
+            if self._ensure_rcsp_ready():
+                self._send_raw(protocol.build_set_ear_detection(self._mark_write_seq(), enabled))
             self._persist_state()
             with self._lock:
                 return dict(self.state)
@@ -1016,10 +1131,11 @@ class RedmiNeoDaemon:
             with self._lock:
                 self.state["finding"] = enabled
                 self.state["error"] = None
-            if self._rfcomm_is_fastpair:
-                self._send_raw(protocol.build_fastpair_ring(enabled))
-            else:
-                self._send_raw(protocol.build_set_find_device(self._next_seq(), enabled))
+            if self._ensure_rcsp_ready():
+                if self._rfcomm_is_fastpair:
+                    self._send_raw(protocol.build_fastpair_ring(enabled))
+                else:
+                    self._send_raw(protocol.build_set_find_device(self._mark_write_seq(), enabled))
             with self._lock:
                 return dict(self.state)
 
@@ -1032,7 +1148,9 @@ class RedmiNeoDaemon:
                     gestures[slot] = action
                     self.state["gestures"] = gestures
                     self.state["error"] = None
-                self._send_raw(protocol.build_set_gesture(self._next_seq(), slot, action))
+                if self._ensure_rcsp_ready():
+                    self._send_raw(protocol.build_set_gesture(self._mark_write_seq(), slot, action))
+                    time.sleep(0.05)
                 self._persist_state()
             with self._lock:
                 return dict(self.state)
@@ -1043,7 +1161,9 @@ class RedmiNeoDaemon:
                 with self._lock:
                     self.state["anc_cycle"] = cycle_mode
                     self.state["error"] = None
-                self._send_raw(protocol.build_set_anc_cycle(self._next_seq(), cycle_mode))
+                if self._ensure_rcsp_ready():
+                    self._send_raw(protocol.build_set_anc_cycle(self._mark_write_seq(), cycle_mode))
+                    time.sleep(0.05)
                 self._persist_state()
             with self._lock:
                 return dict(self.state)
