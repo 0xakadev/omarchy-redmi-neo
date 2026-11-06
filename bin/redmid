@@ -1,0 +1,1164 @@
+#!/usr/bin/python3
+"""Background daemon for Omarchy REDMI Headphones Neo plugin (0xakadev.redmi-neo).
+
+Maintains:
+- BlueZ D-Bus state discovery (Connected, Battery1, ManufacturerData 0xFFFF/0x1727, paired devices)
+- RFCOMM RCSP persistent connection with SAFER+ mutual authentication
+- Real-time push notifications from the headphones (OP_REPORT_STATUS 0x0E & OP_NOTIFY_CONFIG 0xF4)
+- Local Unix domain socket IPC ($XDG_RUNTIME_DIR/redmi-neo.sock) with SO_PEERCRED UID verification
+"""
+
+from __future__ import annotations
+
+import os
+import socket
+import sys
+
+sys.dont_write_bytecode = True
+
+# Ensure system Python with Bluetooth & D-Bus bindings is used even if invoked via mise/pyenv python3
+if not hasattr(socket, "AF_BLUETOOTH") and os.path.exists("/usr/bin/python3"):
+    os.execv("/usr/bin/python3", ["/usr/bin/python3"] + sys.argv)
+
+import ctypes
+import errno
+import json
+import re
+import signal
+import stat
+import struct
+import subprocess
+import tempfile
+import threading
+import time
+from pathlib import Path
+from typing import Any
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+import protocol  # noqa: E402
+
+try:
+    import dbus  # type: ignore
+except ImportError:
+    dbus = None
+
+
+# ── Paths & Security Helpers ──
+
+def runtime_socket_path() -> Path:
+    xdg = os.environ.get("XDG_RUNTIME_DIR")
+    if xdg:
+        base = Path(xdg)
+    else:
+        base = Path(f"/run/user/{os.getuid()}")
+    return base / "redmi-neo.sock"
+
+
+def config_file_path() -> Path:
+    xdg = os.environ.get("XDG_CONFIG_HOME")
+    base = Path(xdg) if xdg else (Path.home() / ".config")
+    return base / "omarchy-redmi-neo" / "config.json"
+
+
+def _safe_mkdir(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    st = os.lstat(path)
+    if stat.S_ISLNK(st.st_mode):
+        raise RuntimeError(f"Refusing symlink directory: {path}")
+
+
+def load_config() -> dict[str, Any]:
+    path = config_file_path()
+    try:
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(str(path), flags)
+        with os.fdopen(fd, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+            return data if isinstance(data, dict) else {}
+    except FileNotFoundError:
+        return {}
+    except Exception:
+        return {}
+
+
+def save_config(data: dict[str, Any]) -> None:
+    path = config_file_path()
+    try:
+        _safe_mkdir(path.parent)
+        fd, tmp_name = tempfile.mkstemp(prefix=".config.", dir=str(path.parent))
+        try:
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(data, fh, indent=2, sort_keys=True)
+                fh.flush()
+                os.fsync(fh.fileno())
+            if path.exists() and path.is_symlink():
+                raise RuntimeError(f"Refusing to overwrite symlink config: {path}")
+            os.replace(tmp_name, str(path))
+        finally:
+            if os.path.exists(tmp_name):
+                try:
+                    os.unlink(tmp_name)
+                except OSError:
+                    pass
+    except Exception:
+        pass
+
+
+def verify_peer_uid(conn: socket.socket) -> bool:
+    """Verifies via SO_PEERCRED that the client socket belongs to the same Unix UID."""
+    try:
+        so_peercred = getattr(socket, "SO_PEERCRED", 17)
+        creds = conn.getsockopt(socket.SOL_SOCKET, so_peercred, struct.calcsize("3i"))
+        _pid, uid, _gid = struct.unpack("3i", creds)
+        return uid == os.getuid()
+    except Exception:
+        return False
+
+
+# ── SDP RFCOMM Channel Resolver (via libbluetooth.so.3) ──
+
+class _bdaddr_t(ctypes.Structure):
+    _fields_ = [("b", ctypes.c_uint8 * 6)]
+
+
+class _uuid_val(ctypes.Union):
+    _fields_ = [
+        ("uuid16", ctypes.c_uint16),
+        ("uuid32", ctypes.c_uint32),
+        ("uuid128", ctypes.c_uint8 * 16),
+    ]
+
+
+class _uuid_t(ctypes.Structure):
+    _fields_ = [
+        ("type", ctypes.c_uint8),
+        ("value", _uuid_val),
+    ]
+
+
+class _sdp_list_t(ctypes.Structure):
+    pass
+
+
+_sdp_list_t._fields_ = [
+    ("next", ctypes.POINTER(_sdp_list_t)),
+    ("data", ctypes.c_void_p),
+]
+
+RFCOMM_UUID = 0x0003
+SDP_ATTR_REQ_RANGE = 0x0002
+
+
+def sdp_find_rfcomm_channel(mac: str, uuid_str: str) -> int | None:
+    """Queries the remote Bluetooth device SDP server for the RFCOMM channel of `uuid_str`."""
+    try:
+        libbt = ctypes.CDLL("libbluetooth.so.3")
+    except OSError:
+        return None
+
+    try:
+        libbt.sdp_connect.argtypes = [ctypes.POINTER(_bdaddr_t), ctypes.POINTER(_bdaddr_t), ctypes.c_uint32]
+        libbt.sdp_connect.restype = ctypes.c_void_p
+        libbt.sdp_close.argtypes = [ctypes.c_void_p]
+        libbt.sdp_uuid128_create.argtypes = [ctypes.POINTER(_uuid_t), ctypes.c_void_p]
+        libbt.sdp_uuid16_create.argtypes = [ctypes.POINTER(_uuid_t), ctypes.c_uint16]
+        libbt.sdp_list_append.argtypes = [ctypes.POINTER(_sdp_list_t), ctypes.c_void_p]
+        libbt.sdp_list_append.restype = ctypes.POINTER(_sdp_list_t)
+        libbt.sdp_list_free.argtypes = [ctypes.POINTER(_sdp_list_t), ctypes.c_void_p]
+        libbt.sdp_service_search_attr_req.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(_sdp_list_t),
+            ctypes.c_int,
+            ctypes.POINTER(_sdp_list_t),
+            ctypes.POINTER(ctypes.POINTER(_sdp_list_t)),
+        ]
+        libbt.sdp_service_search_attr_req.restype = ctypes.c_int
+        libbt.sdp_get_access_protos.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.POINTER(_sdp_list_t))]
+        libbt.sdp_get_access_protos.restype = ctypes.c_int
+        libbt.sdp_get_proto_port.argtypes = [ctypes.POINTER(_sdp_list_t), ctypes.c_int]
+        libbt.sdp_get_proto_port.restype = ctypes.c_int
+        libbt.sdp_record_free.argtypes = [ctypes.c_void_p]
+
+        parts = [int(x, 16) for x in mac.split(":")]
+        if len(parts) != 6:
+            return None
+        bd_any = _bdaddr_t((ctypes.c_uint8 * 6)(0, 0, 0, 0, 0, 0))
+        bd_dst = _bdaddr_t((ctypes.c_uint8 * 6)(*reversed(parts)))
+
+        session = libbt.sdp_connect(ctypes.byref(bd_any), ctypes.byref(bd_dst), 0)
+        if not session:
+            return None
+
+        try:
+            u = _uuid_t()
+            raw_uuid = bytes.fromhex(uuid_str.replace("-", ""))
+            libbt.sdp_uuid128_create(ctypes.byref(u), raw_uuid)
+
+            search_list = libbt.sdp_list_append(None, ctypes.byref(u))
+            attr_range = ctypes.c_uint32(0x0000FFFF)
+            attrid_list = libbt.sdp_list_append(None, ctypes.byref(attr_range))
+            seq_list = ctypes.POINTER(_sdp_list_t)()
+
+            err = libbt.sdp_service_search_attr_req(
+                session,
+                search_list,
+                SDP_ATTR_REQ_RANGE,
+                attrid_list,
+                ctypes.byref(seq_list),
+            )
+            libbt.sdp_list_free(search_list, None)
+            libbt.sdp_list_free(attrid_list, None)
+            if err != 0 or not seq_list:
+                return None
+
+            channel: int | None = None
+            curr = seq_list
+            while curr:
+                rec = curr.contents.data
+                if rec:
+                    proto_list = ctypes.POINTER(_sdp_list_t)()
+                    if libbt.sdp_get_access_protos(rec, ctypes.byref(proto_list)) == 0 and proto_list:
+                        port = libbt.sdp_get_proto_port(proto_list, RFCOMM_UUID)
+                        if port > 0:
+                            channel = int(port)
+                        libbt.sdp_list_free(proto_list, None)
+                    libbt.sdp_record_free(rec)
+                if channel is not None:
+                    break
+                curr = curr.contents.next
+            libbt.sdp_list_free(seq_list, None)
+            return channel
+        finally:
+            libbt.sdp_close(session)
+    except Exception:
+        return None
+
+
+# ── BlueZ & PipeWire Helpers ──
+
+def is_redmi_neo_candidate(dev: dict[str, Any]) -> bool:
+    name = (dev.get("name") or "").lower()
+    alias = (dev.get("alias") or "").lower()
+    if "redmi" in name or "redmi" in alias or "xiaomi" in name or "miwear" in name:
+        return True
+    if dev.get("pid") == "50f0" or dev.get("vid") == "2717":
+        return True
+    uuids = [u.lower() for u in (dev.get("uuids") or [])]
+    if protocol.UUID_MIUI_SPP in uuids or protocol.UUID_XIAOMI_MMA in uuids:
+        return True
+    return False
+
+
+def query_bluez_devices() -> list[dict[str, Any]]:
+    """Returns all paired/known Bluetooth devices from BlueZ via D-Bus."""
+    if dbus is None:
+        return []
+    devices: list[dict[str, Any]] = []
+    try:
+        bus = dbus.SystemBus()
+        mgr = dbus.Interface(bus.get_object("org.bluez", "/"), "org.freedesktop.DBus.ObjectManager")
+        objects = mgr.GetManagedObjects()
+        for path, ifaces in objects.items():
+            dev_props = ifaces.get("org.bluez.Device1")
+            if not dev_props:
+                continue
+            mac = str(dev_props.get("Address", "")).upper()
+            if not mac:
+                continue
+            name = str(dev_props.get("Name", "") or dev_props.get("Alias", "") or mac)
+            alias = str(dev_props.get("Alias", "") or name)
+            connected = bool(dev_props.get("Connected", False))
+            paired = bool(dev_props.get("Paired", False))
+            uuids = [str(u).lower() for u in dev_props.get("UUIDs", [])]
+
+            # Parse ManufacturerData if present
+            mfg_raw: dict[int, bytes] = {}
+            if "ManufacturerData" in dev_props:
+                for k, v in dev_props["ManufacturerData"].items():
+                    try:
+                        mfg_raw[int(k)] = bytes(int(b) for b in v)
+                    except Exception:
+                        pass
+            mfg_parsed = protocol.parse_manufacturer_data(mfg_raw)
+
+            # Check org.bluez.Battery1 if exposed
+            batt_props = ifaces.get("org.bluez.Battery1")
+            bluez_battery: int | None = None
+            if batt_props and "Percentage" in batt_props:
+                try:
+                    bluez_battery = int(batt_props["Percentage"])
+                except Exception:
+                    bluez_battery = None
+
+            item: dict[str, Any] = {
+                "path": str(path),
+                "mac": mac,
+                "name": name,
+                "alias": alias,
+                "connected": connected,
+                "paired": paired,
+                "uuids": uuids,
+                "bluez_battery": bluez_battery,
+                "beacon_battery": mfg_parsed.get("battery"),
+                "beacon_charging": mfg_parsed.get("charging", False),
+                "vid": mfg_parsed.get("vid"),
+                "pid": mfg_parsed.get("pid"),
+            }
+            item["is_redmi_neo"] = is_redmi_neo_candidate(item)
+            devices.append(item)
+    except Exception:
+        pass
+    return devices
+
+
+def query_audio_codec(mac: str) -> dict[str, str | None]:
+    """Queries PipeWire / PulseAudio (`pactl`) for the active Bluetooth audio codec and profile."""
+    if not mac:
+        return {"codec": None, "profile": None}
+    mac_underscored = mac.upper().replace(":", "_")
+    try:
+        proc = subprocess.run(
+            ["pactl", "list", "cards"],
+            capture_output=True,
+            text=True,
+            timeout=1.5,
+            check=False,
+        )
+        if proc.returncode != 0 or not proc.stdout:
+            return {"codec": None, "profile": None}
+        blocks = proc.stdout.split("Card #")
+        for blk in blocks:
+            if mac_underscored not in blk.upper():
+                continue
+            codec: str | None = None
+            profile: str | None = None
+            m_codec = re.search(r'api\.bluez5\.codec\s*=\s*"([^"]+)"', blk)
+            if m_codec:
+                codec = m_codec.group(1).upper().replace("_", "-")
+            m_prof = re.search(r"Active Profile:\s*([^\n]+)", blk)
+            if m_prof:
+                raw_prof = m_prof.group(1).strip()
+                if "a2dp" in raw_prof.lower():
+                    profile = "A2DP"
+                elif "headset" in raw_prof.lower() or "hfp" in raw_prof.lower():
+                    profile = "HFP"
+                elif raw_prof and raw_prof != "off":
+                    profile = raw_prof
+                if not codec and "codec-" in raw_prof.lower():
+                    codec = raw_prof.split("codec-", 1)[1].upper().replace("_", "-")
+            return {"codec": codec, "profile": profile}
+    except Exception:
+        pass
+    return {"codec": None, "profile": None}
+
+
+def bluez_connect_device(mac: str, connect: bool) -> tuple[bool, str | None]:
+    """Connects or disconnects the device via BlueZ D-Bus (with bluetoothctl fallback)."""
+    action = "connect" if connect else "disconnect"
+    if dbus is not None:
+        try:
+            bus = dbus.SystemBus()
+            mgr = dbus.Interface(bus.get_object("org.bluez", "/"), "org.freedesktop.DBus.ObjectManager")
+            objects = mgr.GetManagedObjects()
+            for path, ifaces in objects.items():
+                dev_props = ifaces.get("org.bluez.Device1")
+                if not dev_props:
+                    continue
+                if str(dev_props.get("Address", "")).upper() == mac.upper():
+                    dev_iface = dbus.Interface(bus.get_object("org.bluez", path), "org.bluez.Device1")
+                    if connect:
+                        dev_iface.Connect(timeout=12)
+                    else:
+                        dev_iface.Disconnect(timeout=6)
+                    return True, None
+        except Exception as exc:
+            err_msg = str(exc)
+            # Fall through to bluetoothctl if D-Bus call timed out or raised
+            try:
+                proc = subprocess.run(
+                    ["bluetoothctl", action, mac],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                    check=False,
+                )
+                if proc.returncode == 0 or "successful" in (proc.stdout or "").lower():
+                    return True, None
+            except Exception:
+                pass
+            return False, err_msg
+
+    try:
+        proc = subprocess.run(
+            ["bluetoothctl", action, mac],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        if proc.returncode == 0:
+            return True, None
+        return False, (proc.stderr or proc.stdout or f"bluetoothctl {action} failed").strip()
+    except Exception as exc:
+        return False, str(exc)
+
+
+# ── REDMI Headphones Neo Daemon State & RFCOMM Controller ──
+
+DEFAULT_GESTURES = {
+    "single": "play_pause",
+    "double": "next",
+    "triple": "previous",
+    "long": "anc_cycle",
+}
+
+
+class RedmiNeoDaemon:
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self._cfg = load_config()
+        self._seq = 0
+        self._rfcomm_sock: socket.socket | None = None
+        self._rfcomm_mac: str | None = None
+        self._rfcomm_channel: int | None = None
+        self._rfcomm_is_fastpair = False
+        self._rfcomm_authenticated = False
+        self._connecting_rfcomm = False
+        self._last_rfcomm_attempt = 0.0
+        self._last_codec_check = 0.0
+        self._stop_event = threading.Event()
+
+        # Initialize state from persisted config so the UI always has rich context
+        self.state: dict[str, Any] = {
+            "connected": False,
+            "rcsp_connected": False,
+            "connecting": False,
+            "name": self._cfg.get("name", protocol.DEVICE_NAME_DEFAULT),
+            "mac": self._cfg.get("mac", ""),
+            "model": protocol.MODEL_ID,
+            "sale_model": protocol.SALE_MODEL,
+            "vid": self._cfg.get("vid", "2717"),
+            "pid": self._cfg.get("pid", "50f0"),
+            "firmware": self._cfg.get("firmware"),
+            "battery": self._cfg.get("last_battery"),
+            "charging": bool(self._cfg.get("last_charging", False)),
+            "battery_source": self._cfg.get("battery_source"),
+            "battery_left": None,
+            "battery_right": None,
+            "battery_case": None,
+            "codec": None,
+            "profile": None,
+            # Noise Control
+            "anc": self._cfg.get("anc", "off"),
+            "anc_available": True,
+            "anc_level": self._cfg.get("anc_level", "balanced"),
+            "trans_level": self._cfg.get("trans_level", "regular"),
+            "adaptive_anc": bool(self._cfg.get("adaptive_anc", False)),
+            # Equalizer
+            "eq": self._cfg.get("eq", "balanced"),
+            "eq_available": True,
+            "eq_bands": list(self._cfg.get("eq_bands") or [0] * 10),
+            "eq_frequencies": list(protocol.EQ_FREQUENCIES),
+            # Device Features
+            "multipoint": bool(self._cfg.get("multipoint", False)),
+            "game_mode": bool(self._cfg.get("game_mode", False)),
+            "auto_answer": bool(self._cfg.get("auto_answer", False)),
+            "ear_detection": bool(self._cfg.get("ear_detection", False)),
+            "finding": False,
+            # Button / MFB Controls
+            "gestures": dict(DEFAULT_GESTURES, **(self._cfg.get("gestures") or {})),
+            "anc_cycle": self._cfg.get("anc_cycle", "all"),
+            # Paired Devices List
+            "devices": [],
+            "error": None,
+        }
+        if len(self.state["eq_bands"]) != 10:
+            self.state["eq_bands"] = [0] * 10
+
+    def _next_seq(self) -> int:
+        with self._lock:
+            val = self._seq
+            self._seq = (self._seq + 1) & 0xFF
+            return val
+
+    def _persist_state(self) -> None:
+        with self._lock:
+            for key in (
+                "mac",
+                "name",
+                "vid",
+                "pid",
+                "firmware",
+                "anc",
+                "anc_level",
+                "trans_level",
+                "adaptive_anc",
+                "eq",
+                "eq_bands",
+                "multipoint",
+                "game_mode",
+                "auto_answer",
+                "ear_detection",
+                "gestures",
+                "anc_cycle",
+                "battery_source",
+            ):
+                if self.state.get(key) is not None:
+                    self._cfg[key] = self.state[key]
+            if self.state.get("battery") is not None:
+                self._cfg["last_battery"] = self.state["battery"]
+                self._cfg["last_charging"] = bool(self.state.get("charging", False))
+            cfg_copy = dict(self._cfg)
+        save_config(cfg_copy)
+
+    # ── BlueZ & System Refresh ──
+
+    def refresh_bluez(self, force_codec: bool = False) -> None:
+        devices = query_bluez_devices()
+        with self._lock:
+            preferred_mac = (self.state.get("mac") or "").upper()
+            chosen: dict[str, Any] | None = None
+
+            # 1. Match preferred MAC if present
+            if preferred_mac:
+                for d in devices:
+                    if d["mac"] == preferred_mac:
+                        chosen = d
+                        break
+
+            # 2. Match connected REDMI Headphones Neo candidate
+            if chosen is None:
+                for d in devices:
+                    if d.get("is_redmi_neo") and d.get("connected"):
+                        chosen = d
+                        break
+
+            # 3. Match any paired REDMI Headphones Neo candidate
+            if chosen is None:
+                for d in devices:
+                    if d.get("is_redmi_neo"):
+                        chosen = d
+                        break
+
+            # 4. Fallback to first connected or paired device
+            if chosen is None and devices:
+                chosen = next((d for d in devices if d.get("connected")), devices[0])
+
+            ui_devices = [
+                {
+                    "mac": d["mac"],
+                    "name": d["alias"] or d["name"],
+                    "connected": d["connected"],
+                    "is_redmi_neo": d["is_redmi_neo"],
+                    "battery": d.get("bluez_battery") if d.get("bluez_battery") is not None else d.get("beacon_battery"),
+                }
+                for d in devices
+            ]
+            self.state["devices"] = ui_devices
+
+            if chosen is not None:
+                mac = chosen["mac"]
+                was_connected = bool(self.state.get("connected"))
+                now_connected = bool(chosen.get("connected"))
+                self.state["mac"] = mac
+                self.state["name"] = chosen.get("alias") or chosen.get("name") or protocol.DEVICE_NAME_DEFAULT
+                self.state["connected"] = now_connected
+                if chosen.get("vid"):
+                    self.state["vid"] = chosen["vid"]
+                if chosen.get("pid"):
+                    self.state["pid"] = chosen["pid"]
+
+                # Update battery from BlueZ Battery1 or BLE ManufacturerData 0xFFFF beacon
+                # if RCSP hasn't provided a fresher reading while connected
+                if chosen.get("bluez_battery") is not None and not self.state.get("rcsp_connected"):
+                    self.state["battery"] = chosen["bluez_battery"]
+                    self.state["battery_source"] = "bluez"
+                elif chosen.get("beacon_battery") is not None and (
+                    self.state.get("battery") is None or not self.state.get("rcsp_connected")
+                ):
+                    self.state["battery"] = chosen["beacon_battery"]
+                    self.state["charging"] = bool(chosen.get("beacon_charging", False))
+                    self.state["battery_source"] = "beacon"
+
+                if not now_connected:
+                    self.state["rcsp_connected"] = False
+                    self.state["codec"] = None
+                    self.state["profile"] = None
+                    self.state["finding"] = False
+                    if was_connected:
+                        self._close_rfcomm()
+                else:
+                    now = time.monotonic()
+                    if force_codec or (now - self._last_codec_check > 4.0) or not self.state.get("codec"):
+                        self._last_codec_check = now
+                        audio_info = query_audio_codec(mac)
+                        self.state["codec"] = audio_info.get("codec")
+                        self.state["profile"] = audio_info.get("profile")
+
+                    # Ensure RFCOMM RCSP session is started if connected
+                    if (
+                        self._rfcomm_sock is None
+                        and not self._connecting_rfcomm
+                        and (now - self._last_rfcomm_attempt > 3.0)
+                    ):
+                        self._last_rfcomm_attempt = now
+                        self._connecting_rfcomm = True
+                        threading.Thread(
+                            target=self._connect_rfcomm_worker,
+                            args=(mac,),
+                            daemon=True,
+                        ).start()
+
+        self._persist_state()
+
+    # ── RFCOMM RCSP Transport ──
+
+    def _close_rfcomm(self) -> None:
+        with self._lock:
+            sock = self._rfcomm_sock
+            self._rfcomm_sock = None
+            self._rfcomm_authenticated = False
+            self.state["rcsp_connected"] = False
+        if sock is not None:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except Exception:
+                pass
+            try:
+                sock.close()
+            except Exception:
+                pass
+
+    def _resolve_rfcomm_candidates(self, mac: str) -> tuple[list[int], int | None]:
+        channels: list[int] = []
+        rcsp_ch = sdp_find_rfcomm_channel(mac, protocol.UUID_MIUI_SPP)
+        if rcsp_ch:
+            channels.append(rcsp_ch)
+        fp_ch = sdp_find_rfcomm_channel(mac, protocol.UUID_FASTPAIR_STREAM)
+        if not fp_ch:
+            fp_ch = sdp_find_rfcomm_channel(mac, protocol.UUID_FASTPAIR_FE2C)
+        if fp_ch and fp_ch not in channels:
+            channels.append(fp_ch)
+        for uuid_str in protocol.SERVICE_UUID_PRIORITY:
+            ch = sdp_find_rfcomm_channel(mac, uuid_str)
+            if ch and ch not in channels:
+                channels.append(ch)
+        for fallback in (6, 5, 24, 8, 1):
+            if fallback not in channels:
+                channels.append(fallback)
+        return channels, (fp_ch or 5)
+
+    def _connect_rfcomm_worker(self, mac: str) -> None:
+        try:
+            candidates, fp_channel = self._resolve_rfcomm_candidates(mac)
+            connected_sock: socket.socket | None = None
+            used_channel: int | None = None
+
+            for ch in candidates:
+                with self._lock:
+                    if not self.state.get("connected") or self._stop_event.is_set():
+                        return
+                s = socket.socket(socket.AF_BLUETOOTH, socket.SOCK_STREAM, socket.BTPROTO_RFCOMM)
+                s.settimeout(2.2)
+                try:
+                    s.connect((mac, ch))
+                    connected_sock = s
+                    used_channel = ch
+                    break
+                except OSError:
+                    try:
+                        s.close()
+                    except Exception:
+                        pass
+
+            if connected_sock is None:
+                return
+
+            with self._lock:
+                self._rfcomm_sock = connected_sock
+                self._rfcomm_mac = mac
+                self._rfcomm_channel = used_channel
+                self._rfcomm_is_fastpair = used_channel == fp_channel
+                self.state["rcsp_connected"] = True
+                self.state["error"] = None
+
+            # Perform SAFER+ authentication handshake + RCSP / Fast Pair stream session
+            self._run_rcsp_session(connected_sock, is_fastpair=(used_channel == fp_channel))
+        except Exception:
+            pass
+        finally:
+            with self._lock:
+                self._connecting_rfcomm = False
+
+    def _send_raw(self, data: bytes) -> bool:
+        with self._lock:
+            sock = self._rfcomm_sock
+        if sock is None:
+            return False
+        try:
+            sock.sendall(data)
+            return True
+        except OSError:
+            self._close_rfcomm()
+            return False
+
+    def _query_initial_device_state(self) -> None:
+        """Sends initial RCSP queries after connecting/authenticating."""
+        frames = [
+            protocol.build_get_device_info(self._next_seq()),
+            protocol.build_get_run_info(self._next_seq()),
+            protocol.build_get_config(self._next_seq(), protocol.CFG_EFFECT_STRENGTH),
+            protocol.build_get_config(self._next_seq(), protocol.CFG_ADAPTIVE_ANC),
+            protocol.build_get_config(self._next_seq(), protocol.CFG_EQ_PRESET),
+            protocol.build_get_config(self._next_seq(), protocol.CFG_EQ_CURVE),
+            protocol.build_get_config(self._next_seq(), protocol.CFG_MULTIPOINT),
+            protocol.build_get_config(self._next_seq(), protocol.CFG_GAME_MODE),
+            protocol.build_get_config(self._next_seq(), protocol.CFG_AUTO_ANSWER),
+            protocol.build_get_config(self._next_seq(), protocol.CFG_GESTURES),
+            protocol.build_get_config(self._next_seq(), protocol.CFG_ANC_CYCLE),
+        ]
+        for frame in frames:
+            if not self._send_raw(frame):
+                break
+            time.sleep(0.03)
+
+    def _apply_parsed_updates(self, updates: dict[str, Any], from_rcsp: bool = True) -> None:
+        if not updates:
+            return
+        with self._lock:
+            for k, v in updates.items():
+                if k == "gestures" and isinstance(v, dict):
+                    merged = dict(self.state.get("gestures") or DEFAULT_GESTURES)
+                    merged.update(v)
+                    self.state["gestures"] = merged
+                elif v is not None:
+                    self.state[k] = v
+            if from_rcsp and "battery" in updates and updates["battery"] is not None:
+                self.state["battery_source"] = "rcsp"
+        self._persist_state()
+
+    def _handle_rcsp_packet(self, pkt: protocol.RcspPacket, auth: protocol.CommandAuthSession) -> None:
+        # 1. Handle SAFER+ mutual authentication packets (0x50 / 0x51)
+        if pkt.opcode in (protocol.OP_AUTH_CHALLENGE, protocol.OP_AUTH_CONFIRM):
+            replies = auth.feed_packet(pkt)
+            for rep in replies:
+                self._send_raw(rep)
+            if auth.authenticated and not self._rfcomm_authenticated:
+                self._rfcomm_authenticated = True
+                self._query_initial_device_state()
+            return
+
+        # 2. Acknowledge device-initiated requests/notifications if required
+        if pkt.expects_ack and pkt.seq is not None:
+            self._send_raw(protocol.build_response(pkt.opcode, pkt.seq))
+
+        # 3. Parse payload by opcode
+        if pkt.opcode == protocol.OP_GET_DEVICE_INFO and pkt.is_response:
+            info = protocol.parse_device_info_tlvs(pkt.payload)
+            self._apply_parsed_updates(info, from_rcsp=True)
+
+        elif pkt.opcode == protocol.OP_GET_RUN_INFO and pkt.is_response:
+            info = protocol.parse_run_info_tlvs(pkt.payload)
+            self._apply_parsed_updates(info, from_rcsp=True)
+
+        elif pkt.opcode == protocol.OP_REPORT_STATUS and pkt.is_request_or_notify:
+            info = protocol.parse_report_status_tlvs(pkt.payload)
+            self._apply_parsed_updates(info, from_rcsp=True)
+
+        elif pkt.opcode in (protocol.OP_GET_CONFIG, protocol.OP_NOTIFY_CONFIG):
+            info = protocol.parse_config_records(pkt.payload)
+            self._apply_parsed_updates(info, from_rcsp=True)
+
+    def _run_rcsp_session(self, sock: socket.socket, is_fastpair: bool = False) -> None:
+        parser = protocol.RcspStreamParser()
+        fp_parser = protocol.FastPairStreamParser()
+        with self._lock:
+            self._seq = 0
+        auth = protocol.CommandAuthSession(self._next_seq)
+
+        if not is_fastpair:
+            # Start SAFER+ mutual authentication handshake on MIUI RCSP channel
+            self._send_raw(auth.start())
+        sock.settimeout(1.2)
+        queried_fallback = is_fastpair
+        start_ts = time.monotonic()
+
+        try:
+            while not self._stop_event.is_set():
+                with self._lock:
+                    if self._rfcomm_sock is not sock:
+                        break
+                try:
+                    chunk = sock.recv(512)
+                    if not chunk:
+                        break
+                    if protocol.FRAME_HEAD in chunk:
+                        for pkt in parser.feed(chunk):
+                            self._handle_rcsp_packet(pkt, auth)
+                    else:
+                        fp_updates = fp_parser.feed(chunk)
+                        if fp_updates:
+                            self._apply_parsed_updates(fp_updates, from_rcsp=False)
+                        for pkt in parser.feed(chunk):
+                            self._handle_rcsp_packet(pkt, auth)
+                except socket.timeout:
+                    if not self._rfcomm_authenticated and not queried_fallback and (time.monotonic() - start_ts >= 1.0):
+                        queried_fallback = True
+                        self._query_initial_device_state()
+                        sock.settimeout(5.0)
+                    elif is_fastpair:
+                        sock.settimeout(5.0)
+                    continue
+                except OSError:
+                    break
+        finally:
+            with self._lock:
+                if self._rfcomm_sock is sock:
+                    self._close_rfcomm()
+
+    # ── User Commands from CLI / QML Panel ──
+
+    def handle_command(self, req: dict[str, Any]) -> dict[str, Any]:
+        cmd = str(req.get("cmd") or "state")
+
+        if cmd == "state":
+            self.refresh_bluez(force_codec=False)
+            with self._lock:
+                return dict(self.state)
+
+        if cmd == "poll":
+            self.refresh_bluez(force_codec=True)
+            if self._rfcomm_sock is not None:
+                self._query_initial_device_state()
+                time.sleep(0.15)
+            with self._lock:
+                return dict(self.state)
+
+        if cmd == "scan":
+            self.refresh_bluez(force_codec=True)
+            with self._lock:
+                return {"devices": list(self.state["devices"]), "mac": self.state["mac"]}
+
+        if cmd == "use":
+            mac = str(req.get("mac") or "").strip().upper()
+            if mac:
+                with self._lock:
+                    if self.state.get("mac") != mac:
+                        self._close_rfcomm()
+                    self.state["mac"] = mac
+                self.refresh_bluez(force_codec=True)
+            with self._lock:
+                return dict(self.state)
+
+        if cmd in ("connect", "disconnect"):
+            want_connect = cmd == "connect"
+            self.refresh_bluez(force_codec=False)
+            with self._lock:
+                mac = str(req.get("mac") or self.state.get("mac") or "").strip().upper()
+                self.state["connecting"] = True
+                self.state["error"] = None
+            if not mac:
+                with self._lock:
+                    self.state["connecting"] = False
+                    self.state["error"] = "No REDMI Headphones Neo MAC configured"
+                    return dict(self.state)
+
+            if not want_connect:
+                self._close_rfcomm()
+
+            ok, err = bluez_connect_device(mac, want_connect)
+            time.sleep(0.4)
+            self.refresh_bluez(force_codec=True)
+            with self._lock:
+                self.state["connecting"] = False
+                if not ok and err:
+                    self.state["error"] = err
+                return dict(self.state)
+
+        if cmd == "anc":
+            mode = str(req.get("mode") or "").lower()
+            if mode in protocol.ANC_MODE_TO_BYTE:
+                with self._lock:
+                    self.state["anc"] = mode
+                    self.state["error"] = None
+                self._send_raw(protocol.build_set_anc_mode(self._next_seq(), mode))
+                self._persist_state()
+            with self._lock:
+                return dict(self.state)
+
+        if cmd == "anc-level":
+            level = str(req.get("level") or "").lower()
+            if level in protocol.ANC_LEVEL_TO_BYTE:
+                with self._lock:
+                    self.state["anc_level"] = level
+                    if level != "adaptive":
+                        self.state["adaptive_anc"] = False
+                    self.state["error"] = None
+                self._send_raw(protocol.build_set_anc_level(self._next_seq(), level))
+                self._persist_state()
+            with self._lock:
+                return dict(self.state)
+
+        if cmd == "trans-level":
+            level = str(req.get("level") or "").lower()
+            if level in protocol.TRANS_LEVEL_TO_BYTE:
+                with self._lock:
+                    self.state["trans_level"] = level
+                    self.state["error"] = None
+                self._send_raw(protocol.build_set_trans_level(self._next_seq(), level))
+                self._persist_state()
+            with self._lock:
+                return dict(self.state)
+
+        if cmd == "adaptive-anc":
+            enabled = bool(req.get("enabled"))
+            with self._lock:
+                self.state["adaptive_anc"] = enabled
+                self.state["error"] = None
+            self._send_raw(protocol.build_set_adaptive_anc(self._next_seq(), enabled))
+            if enabled:
+                self._send_raw(protocol.build_set_anc_level(self._next_seq(), "adaptive"))
+            else:
+                lvl = str(self.state.get("anc_level") or "balanced")
+                if lvl == "adaptive":
+                    lvl = "balanced"
+                self._send_raw(protocol.build_set_anc_level(self._next_seq(), lvl))
+            self._persist_state()
+            with self._lock:
+                return dict(self.state)
+
+        if cmd == "eq":
+            preset = str(req.get("preset") or "").lower()
+            if preset in protocol.EQ_PRESET_TO_BYTE:
+                with self._lock:
+                    self.state["eq"] = preset
+                    self.state["error"] = None
+                self._send_raw(protocol.build_set_eq_preset(self._next_seq(), preset))
+                if preset == "custom":
+                    with self._lock:
+                        bands = list(self.state.get("eq_bands") or [0] * 10)
+                    self._send_raw(protocol.build_set_eq_curve(self._next_seq(), bands))
+                self._persist_state()
+            with self._lock:
+                return dict(self.state)
+
+        if cmd == "eq-bands":
+            raw_bands = req.get("bands")
+            if isinstance(raw_bands, list) and len(raw_bands) == 10:
+                bands = [max(protocol.EQ_GAIN_MIN, min(protocol.EQ_GAIN_MAX, int(round(float(x))))) for x in raw_bands]
+                with self._lock:
+                    self.state["eq_bands"] = bands
+                    self.state["eq"] = "custom"
+                    self.state["error"] = None
+                self._send_raw(protocol.build_set_eq_preset(self._next_seq(), "custom"))
+                self._send_raw(protocol.build_set_eq_curve(self._next_seq(), bands))
+                self._persist_state()
+            with self._lock:
+                return dict(self.state)
+
+        if cmd == "eq-reset":
+            bands = [0] * 10
+            with self._lock:
+                self.state["eq_bands"] = bands
+                self.state["error"] = None
+            if not self._rfcomm_is_fastpair:
+                self._send_raw(protocol.build_eq_reset(self._next_seq()))
+            self._persist_state()
+            with self._lock:
+                return dict(self.state)
+
+        if cmd == "multipoint":
+            enabled = bool(req.get("enabled"))
+            with self._lock:
+                self.state["multipoint"] = enabled
+                self.state["error"] = None
+            self._send_raw(protocol.build_set_multipoint(self._next_seq(), enabled))
+            self._persist_state()
+            with self._lock:
+                return dict(self.state)
+
+        if cmd == "game-mode":
+            enabled = bool(req.get("enabled"))
+            with self._lock:
+                self.state["game_mode"] = enabled
+                self.state["error"] = None
+            self._send_raw(protocol.build_set_game_mode(self._next_seq(), enabled))
+            self._persist_state()
+            with self._lock:
+                return dict(self.state)
+
+        if cmd == "auto-answer":
+            enabled = bool(req.get("enabled"))
+            with self._lock:
+                self.state["auto_answer"] = enabled
+                self.state["error"] = None
+            self._send_raw(protocol.build_set_auto_answer(self._next_seq(), enabled))
+            self._persist_state()
+            with self._lock:
+                return dict(self.state)
+
+        if cmd == "ear-detection":
+            enabled = bool(req.get("enabled"))
+            with self._lock:
+                self.state["ear_detection"] = enabled
+                self.state["error"] = None
+            self._send_raw(protocol.build_set_ear_detection(self._next_seq(), enabled))
+            self._persist_state()
+            with self._lock:
+                return dict(self.state)
+
+        if cmd == "find":
+            enabled = bool(req.get("enabled"))
+            with self._lock:
+                self.state["finding"] = enabled
+                self.state["error"] = None
+            if self._rfcomm_is_fastpair:
+                self._send_raw(protocol.build_fastpair_ring(enabled))
+            else:
+                self._send_raw(protocol.build_set_find_device(self._next_seq(), enabled))
+            with self._lock:
+                return dict(self.state)
+
+        if cmd == "gesture":
+            slot = str(req.get("slot") or "").lower()
+            action = str(req.get("action") or "").lower()
+            if slot in protocol.GESTURE_SLOT_TO_BYTE and action in protocol.GESTURE_ACTION_TO_BYTE:
+                with self._lock:
+                    gestures = dict(self.state.get("gestures") or DEFAULT_GESTURES)
+                    gestures[slot] = action
+                    self.state["gestures"] = gestures
+                    self.state["error"] = None
+                self._send_raw(protocol.build_set_gesture(self._next_seq(), slot, action))
+                self._persist_state()
+            with self._lock:
+                return dict(self.state)
+
+        if cmd == "anc-cycle":
+            cycle_mode = str(req.get("mode") or "").lower()
+            if cycle_mode in protocol.ANC_CYCLE_TO_BYTE:
+                with self._lock:
+                    self.state["anc_cycle"] = cycle_mode
+                    self.state["error"] = None
+                self._send_raw(protocol.build_set_anc_cycle(self._next_seq(), cycle_mode))
+                self._persist_state()
+            with self._lock:
+                return dict(self.state)
+
+        with self._lock:
+            return dict(self.state)
+
+
+# ── Unix Socket Server Loop ──
+
+def _handle_client(conn: socket.socket, daemon: RedmiNeoDaemon) -> None:
+    try:
+        if not verify_peer_uid(conn):
+            return
+        conn.settimeout(2.0)
+        raw = b""
+        while len(raw) < 65536:
+            chunk = conn.recv(4096)
+            if not chunk:
+                break
+            raw += chunk
+            if b"\n" in raw:
+                break
+        if not raw:
+            return
+        line = raw.split(b"\n", 1)[0].decode("utf-8", errors="replace").strip()
+        req = json.loads(line) if line else {"cmd": "state"}
+        resp = daemon.handle_command(req if isinstance(req, dict) else {"cmd": "state"})
+        out = (json.dumps(resp, separators=(",", ":")) + "\n").encode("utf-8")
+        conn.sendall(out)
+    except Exception as exc:
+        try:
+            err_payload = json.dumps({"error": str(exc)}) + "\n"
+            conn.sendall(err_payload.encode("utf-8"))
+        except Exception:
+            pass
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def run_server() -> int:
+    try:
+        signal.signal(signal.SIGHUP, signal.SIG_IGN)
+        signal.signal(signal.SIGPIPE, signal.SIG_IGN)
+    except Exception:
+        pass
+    sock_path = runtime_socket_path()
+    sock_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Check if an existing instance is already listening
+    if sock_path.exists():
+        probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            probe.settimeout(0.5)
+            probe.connect(str(sock_path))
+            probe.close()
+            return 0
+        except OSError:
+            try:
+                if not sock_path.is_symlink():
+                    sock_path.unlink()
+            except OSError:
+                pass
+        finally:
+            try:
+                probe.close()
+            except Exception:
+                pass
+
+    daemon = RedmiNeoDaemon()
+    daemon.refresh_bluez(force_codec=True)
+
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    old_umask = os.umask(0o177)
+    try:
+        server.bind(str(sock_path))
+        os.chmod(str(sock_path), 0o600)
+    finally:
+        os.umask(old_umask)
+
+    server.listen(16)
+    server.settimeout(2.0)
+
+    last_bg_refresh = time.monotonic()
+    try:
+        while True:
+            try:
+                conn, _ = server.accept()
+                threading.Thread(
+                    target=_handle_client,
+                    args=(conn, daemon),
+                    daemon=True,
+                ).start()
+            except socket.timeout:
+                now = time.monotonic()
+                if now - last_bg_refresh >= 5.0:
+                    last_bg_refresh = now
+                    daemon.refresh_bluez(force_codec=False)
+            except KeyboardInterrupt:
+                break
+    finally:
+        try:
+            server.close()
+        except Exception:
+            pass
+        try:
+            if sock_path.exists() and not sock_path.is_symlink():
+                sock_path.unlink()
+        except Exception:
+            pass
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(run_server())

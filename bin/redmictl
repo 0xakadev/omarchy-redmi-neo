@@ -1,0 +1,182 @@
+#!/usr/bin/python3
+"""CLI & IPC client for Omarchy REDMI Headphones Neo plugin (`0xakadev.redmi-neo`).
+
+Usage:
+  redmictl state
+  redmictl poll
+  redmictl connect [MAC]
+  redmictl disconnect [MAC]
+  redmictl anc <off|anc|transparency|cycle>
+  redmictl anc-level <light|balanced|deep>
+  redmictl trans-level <regular|voice|ambient>
+  redmictl adaptive-anc <on|off>
+  redmictl eq <balanced|bass|treble|voice|custom>
+  redmictl eq-bands <b0,b1,b2,b3,b4,b5,b6,b7,b8,b9>
+  redmictl eq-reset
+  redmictl multipoint <on|off>
+  redmictl game-mode <on|off>
+  redmictl auto-answer <on|off>
+  redmictl ear-detection <on|off>
+  redmictl find <on|off>
+  redmictl gesture <single|double|triple|long> <action>
+  redmictl anc-cycle <all|anc_trans|anc_off|trans_off>
+  redmictl use <MAC>
+  redmictl scan
+"""
+
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+import socket
+import subprocess
+import sys
+import time
+from typing import Any
+
+sys.dont_write_bytecode = True
+
+
+def runtime_socket_path() -> Path:
+    xdg = os.environ.get("XDG_RUNTIME_DIR")
+    base = Path(xdg) if xdg else Path(f"/run/user/{os.getuid()}")
+    return base / "redmi-neo.sock"
+
+
+def ensure_daemon_running(sock_path: Path) -> None:
+    daemon_bin = Path(__file__).resolve().parent / "redmid"
+    py_exe = "/usr/bin/python3" if os.path.exists("/usr/bin/python3") else sys.executable
+    subprocess.Popen(
+        [py_exe, str(daemon_bin)],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    deadline = time.monotonic() + 2.5
+    while time.monotonic() < deadline:
+        if sock_path.exists():
+            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                s.settimeout(0.3)
+                s.connect(str(sock_path))
+                s.close()
+                return
+            except OSError:
+                pass
+            finally:
+                try:
+                    s.close()
+                except Exception:
+                    pass
+        time.sleep(0.05)
+
+
+def send_request(req: dict[str, Any], timeout: float = 14.0) -> dict[str, Any]:
+    sock_path = runtime_socket_path()
+    for attempt in range(2):
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            s.settimeout(timeout)
+            s.connect(str(sock_path))
+            payload = (json.dumps(req, separators=(",", ":")) + "\n").encode("utf-8")
+            s.sendall(payload)
+            chunks: list[bytes] = []
+            while True:
+                buf = s.recv(4096)
+                if not buf:
+                    break
+                chunks.append(buf)
+                if b"\n" in buf:
+                    break
+            raw = b"".join(chunks).decode("utf-8", errors="replace").strip()
+            if raw:
+                return json.loads(raw.splitlines()[0])
+            return {"error": "Empty response from redmid"}
+        except OSError as exc:
+            if attempt == 0:
+                ensure_daemon_running(sock_path)
+                continue
+            return {"connected": False, "error": f"Daemon unreachable: {exc}"}
+        finally:
+            try:
+                s.close()
+            except Exception:
+                pass
+    return {"connected": False, "error": "Daemon unreachable"}
+
+
+def _parse_bool(val: str) -> bool:
+    return val.strip().lower() in ("1", "true", "on", "yes", "enable", "enabled")
+
+
+def build_command_from_argv(argv: list[str]) -> dict[str, Any]:
+    if not argv:
+        return {"cmd": "state"}
+    cmd = argv[0].strip().lower()
+
+    if cmd in ("state", "poll", "scan", "eq-reset"):
+        return {"cmd": cmd}
+
+    if cmd in ("connect", "disconnect"):
+        req: dict[str, Any] = {"cmd": cmd}
+        if len(argv) >= 2 and argv[1].strip():
+            req["mac"] = argv[1].strip().upper()
+        return req
+
+    if cmd == "use" and len(argv) >= 2:
+        return {"cmd": "use", "mac": argv[1].strip().upper()}
+
+    if cmd == "anc" and len(argv) >= 2:
+        mode = argv[1].strip().lower()
+        if mode == "cycle":
+            cur = send_request({"cmd": "state"}, timeout=3.0)
+            cur_mode = str(cur.get("anc") or "off")
+            order = ["off", "anc", "transparency"]
+            next_mode = order[(order.index(cur_mode) + 1) % len(order)] if cur_mode in order else "anc"
+            return {"cmd": "anc", "mode": next_mode}
+        if mode == "on":
+            mode = "anc"
+        return {"cmd": "anc", "mode": mode}
+
+    if cmd in ("anc-level", "trans-level") and len(argv) >= 2:
+        return {"cmd": cmd, "level": argv[1].strip().lower()}
+
+    if cmd in ("adaptive-anc", "multipoint", "game-mode", "auto-answer", "ear-detection", "find") and len(argv) >= 2:
+        return {"cmd": cmd, "enabled": _parse_bool(argv[1])}
+
+    if cmd == "eq" and len(argv) >= 2:
+        return {"cmd": "eq", "preset": argv[1].strip().lower()}
+
+    if cmd == "eq-bands" and len(argv) >= 2:
+        raw_arg = " ".join(argv[1:]).replace(",", " ")
+        parts = [p for p in raw_arg.split() if p]
+        bands = [int(round(float(x))) for x in parts[:10]]
+        while len(bands) < 10:
+            bands.append(0)
+        return {"cmd": "eq-bands", "bands": bands}
+
+    if cmd == "gesture" and len(argv) >= 3:
+        return {
+            "cmd": "gesture",
+            "slot": argv[1].strip().lower(),
+            "action": argv[2].strip().lower(),
+        }
+
+    if cmd == "anc-cycle" and len(argv) >= 2:
+        return {"cmd": "anc-cycle", "mode": argv[1].strip().lower()}
+
+    return {"cmd": "state"}
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = sys.argv[1:] if argv is None else argv
+    req = build_command_from_argv(args)
+    resp = send_request(req)
+    print(json.dumps(resp, separators=(",", ":")))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
