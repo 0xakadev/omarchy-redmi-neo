@@ -58,7 +58,7 @@ Panel {
 
   readonly property string ctlBin: Qt.resolvedUrl("bin/redmictl").toString().replace(/^file:\/\//, "")
   readonly property color fgColor: bar ? bar.foreground : Commons.Color.foreground
-  readonly property color accColor: bar ? bar.accent : Commons.Color.accent
+  readonly property color accColor: Commons.Color.accent
   readonly property color urgColor: bar ? bar.urgent : Commons.Color.urgent
   readonly property string fontFam: bar ? bar.fontFamily : Style.font.family
   readonly property color dimColor: Qt.darker(fgColor, 1.45)
@@ -70,7 +70,7 @@ Panel {
   }
 
   function tr(key) {
-    return strings.tr(key);
+    return strings.t(key);
   }
 
   function applyState(raw) {
