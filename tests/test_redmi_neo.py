@@ -156,6 +156,19 @@ class TestRcspProtocolAndCommands(unittest.TestCase):
         parsed_gest = protocol.parse_config_records(pkt_gest.payload)
         self.assertEqual(parsed_gest.get("gestures"), {"double": "next"})
 
+        # Hardware 20-byte (4 x 5-byte) gesture response from REDMI Headphones Neo (0x50F0)
+        hw_gest_payload = bytes.fromhex("160002000101000100010200050001030004000104000f")
+        parsed_hw_gest = protocol.parse_config_records(hw_gest_payload)
+        self.assertEqual(
+            parsed_hw_gest.get("gestures"),
+            {
+                "single": "play_pause",
+                "double": "next",
+                "triple": "previous",
+                "long": "anc_cycle",
+            },
+        )
+
         pkt_cycle = protocol.parse_frame(protocol.build_set_anc_cycle(12, "anc_trans"))
         assert pkt_cycle is not None
         parsed_cycle = protocol.parse_config_records(pkt_cycle.payload)

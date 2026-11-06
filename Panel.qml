@@ -199,8 +199,9 @@ Panel {
   }
 
   function cycleGestureAction(slot) {
-    var opts = Model.gestureActionOptions(panel.tr);
-    var cur = (panel.gestures && panel.gestures[slot]) ? String(panel.gestures[slot]) : "play_pause";
+    var opts = Model.gestureActionOptions(panel.tr, slot);
+    var fallback = slot === "long" ? "anc_cycle" : "play_pause";
+    var cur = (panel.gestures && panel.gestures[slot]) ? String(panel.gestures[slot]) : fallback;
     var idx = 0;
     for (var i = 0; i < opts.length; i++) {
       if (opts[i].value === cur) {
@@ -217,7 +218,8 @@ Panel {
 
   function gestureActionLabel(slot) {
     var opts = Model.gestureActionOptions(panel.tr);
-    var cur = (panel.gestures && panel.gestures[slot]) ? String(panel.gestures[slot]) : "play_pause";
+    var fallback = slot === "long" ? "anc_cycle" : "play_pause";
+    var cur = (panel.gestures && panel.gestures[slot]) ? String(panel.gestures[slot]) : fallback;
     for (var i = 0; i < opts.length; i++) {
       if (opts[i].value === cur) return opts[i].label;
     }
@@ -630,14 +632,74 @@ Panel {
       fontFamily: panel.fontFam
     }
 
-    ButtonGroup {
+    Column {
       width: parent.width
-      options: Model.eqOptions(panel.tr)
-      value: panel.eq
-      foreground: panel.fgColor
-      accent: panel.accColor
-      fontFamily: panel.fontFam
-      onChanged: function(v) { panel.setEqPreset(v); }
+      spacing: Style.space(5)
+
+      Flickable {
+        id: eqFlick
+        width: parent.width
+        height: eqBtnGroup.implicitHeight
+        contentWidth: Math.max(width, eqBtnGroup.implicitWidth)
+        contentHeight: height
+        clip: true
+        boundsBehavior: Flickable.StopAtBounds
+        flickableDirection: Flickable.HorizontalFlick
+        interactive: contentWidth > width
+
+        WheelHandler {
+          onWheel: function(event) {
+            if (eqFlick.contentWidth <= eqFlick.width) return;
+            var delta = event.angleDelta.x !== 0 ? event.angleDelta.x : event.angleDelta.y;
+            var maxScroll = Math.max(0, eqFlick.contentWidth - eqFlick.width);
+            eqFlick.contentX = Math.max(0, Math.min(maxScroll, eqFlick.contentX - delta * 0.5));
+            event.accepted = true;
+          }
+        }
+
+        ButtonGroup {
+          id: eqBtnGroup
+          spacing: Style.spacing.xs
+          options: Model.eqOptions(panel.tr)
+          value: panel.eq
+          foreground: panel.fgColor
+          accent: panel.accColor
+          fontFamily: panel.fontFam
+          onChanged: function(v) { panel.setEqPreset(v); }
+        }
+      }
+
+      // Interactive horizontal scrollbar for Equalizer presets
+      Rectangle {
+        id: eqScrollTrack
+        visible: eqFlick.contentWidth > eqFlick.width
+        width: parent.width
+        height: Style.space(5)
+        radius: height / 2
+        color: Qt.rgba(panel.fgColor.r, panel.fgColor.g, panel.fgColor.b, 0.14)
+
+        Rectangle {
+          id: eqScrollThumb
+          width: parent.width * Math.max(0.2, Math.min(1, eqFlick.width / Math.max(1, eqFlick.contentWidth)))
+          height: parent.height
+          radius: parent.radius
+          x: (parent.width - width) * (eqFlick.contentX / Math.max(1, eqFlick.contentWidth - eqFlick.width))
+          color: panel.accColor
+        }
+
+        MouseArea {
+          anchors.fill: parent
+          anchors.topMargin: -Style.space(4)
+          anchors.bottomMargin: -Style.space(4)
+          function seekTo(mouseX) {
+            var maxScroll = Math.max(0, eqFlick.contentWidth - eqFlick.width);
+            var ratio = Math.max(0, Math.min(1, (mouseX - eqScrollThumb.width / 2) / Math.max(1, eqScrollTrack.width - eqScrollThumb.width)));
+            eqFlick.contentX = ratio * maxScroll;
+          }
+          onPressed: function(mouse) { seekTo(mouse.x); }
+          onPositionChanged: function(mouse) { if (pressed) seekTo(mouse.x); }
+        }
+      }
     }
 
     // 10-Band Custom Equalizer Sliders (shown when Custom EQ is selected)
@@ -893,16 +955,76 @@ Panel {
         font.pixelSize: Style.font.caption
       }
 
-      ButtonGroup {
+      Column {
         width: parent.width
-        options: Model.ancCycleOptions(panel.tr)
-        value: panel.ancCycle
-        foreground: panel.fgColor
-        accent: panel.accColor
-        fontFamily: panel.fontFam
-        onChanged: function(v) {
-          panel.ancCycle = v;
-          panel.runCtl(["anc-cycle", v]);
+        spacing: Style.space(5)
+
+        Flickable {
+          id: ancCycleFlick
+          width: parent.width
+          height: ancCycleBtnGroup.implicitHeight
+          contentWidth: Math.max(width, ancCycleBtnGroup.implicitWidth)
+          contentHeight: height
+          clip: true
+          boundsBehavior: Flickable.StopAtBounds
+          flickableDirection: Flickable.HorizontalFlick
+          interactive: contentWidth > width
+
+          WheelHandler {
+            onWheel: function(event) {
+              if (ancCycleFlick.contentWidth <= ancCycleFlick.width) return;
+              var delta = event.angleDelta.x !== 0 ? event.angleDelta.x : event.angleDelta.y;
+              var maxScroll = Math.max(0, ancCycleFlick.contentWidth - ancCycleFlick.width);
+              ancCycleFlick.contentX = Math.max(0, Math.min(maxScroll, ancCycleFlick.contentX - delta * 0.5));
+              event.accepted = true;
+            }
+          }
+
+          ButtonGroup {
+            id: ancCycleBtnGroup
+            spacing: Style.spacing.xs
+            options: Model.ancCycleOptions(panel.tr)
+            value: panel.ancCycle
+            foreground: panel.fgColor
+            accent: panel.accColor
+            fontFamily: panel.fontFam
+            onChanged: function(v) {
+              panel.ancCycle = v;
+              panel.runCtl(["anc-cycle", v]);
+            }
+          }
+        }
+
+        // Interactive horizontal scrollbar for Long-press ANC cycle modes
+        Rectangle {
+          id: ancCycleScrollTrack
+          visible: ancCycleFlick.contentWidth > ancCycleFlick.width
+          width: parent.width
+          height: Style.space(5)
+          radius: height / 2
+          color: Qt.rgba(panel.fgColor.r, panel.fgColor.g, panel.fgColor.b, 0.14)
+
+          Rectangle {
+            id: ancCycleScrollThumb
+            width: parent.width * Math.max(0.2, Math.min(1, ancCycleFlick.width / Math.max(1, ancCycleFlick.contentWidth)))
+            height: parent.height
+            radius: parent.radius
+            x: (parent.width - width) * (ancCycleFlick.contentX / Math.max(1, ancCycleFlick.contentWidth - ancCycleFlick.width))
+            color: panel.accColor
+          }
+
+          MouseArea {
+            anchors.fill: parent
+            anchors.topMargin: -Style.space(4)
+            anchors.bottomMargin: -Style.space(4)
+            function seekTo(mouseX) {
+              var maxScroll = Math.max(0, ancCycleFlick.contentWidth - ancCycleFlick.width);
+              var ratio = Math.max(0, Math.min(1, (mouseX - ancCycleScrollThumb.width / 2) / Math.max(1, ancCycleScrollTrack.width - ancCycleScrollThumb.width)));
+              ancCycleFlick.contentX = ratio * maxScroll;
+            }
+            onPressed: function(mouse) { seekTo(mouse.x); }
+            onPositionChanged: function(mouse) { if (pressed) seekTo(mouse.x); }
+          }
         }
       }
     }

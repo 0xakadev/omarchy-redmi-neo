@@ -107,8 +107,27 @@ function gestureSlots(tr) {
   ];
 }
 
-function gestureActionOptions(tr) {
+function gestureActionOptions(tr, slot) {
   var t = tr || function(k) { return k; };
+  if (slot === "long") {
+    return [
+      { value: "anc_cycle",       label: t("action.anc_cycle") },
+      { value: "voice_assistant", label: t("action.voice_assistant") },
+      { value: "game_mode",       label: t("action.game_mode") },
+      { value: "none",            label: t("action.none") }
+    ];
+  }
+  if (slot === "single" || slot === "double" || slot === "triple") {
+    return [
+      { value: "play_pause",      label: t("action.play_pause") },
+      { value: "next",            label: t("action.next") },
+      { value: "previous",        label: t("action.previous") },
+      { value: "volume_up",       label: t("action.volume_up") },
+      { value: "volume_down",     label: t("action.volume_down") },
+      { value: "voice_assistant", label: t("action.voice_assistant") },
+      { value: "none",            label: t("action.none") }
+    ];
+  }
   return [
     { value: "play_pause",      label: t("action.play_pause") },
     { value: "next",            label: t("action.next") },

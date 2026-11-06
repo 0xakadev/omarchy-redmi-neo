@@ -736,9 +736,11 @@ class RedmiNeoDaemon:
             return False
 
     def _query_live_status(self) -> None:
-        """Sends lightweight real-time status queries (ANC mode/level + battery)."""
+        """Sends lightweight real-time status queries (ANC mode/level, MFB gestures, ANC cycle, battery)."""
         frames = [
             protocol.build_get_config(self._next_seq(), protocol.CFG_EFFECT_STRENGTH),
+            protocol.build_get_config(self._next_seq(), protocol.CFG_GESTURES),
+            protocol.build_get_config(self._next_seq(), protocol.CFG_ANC_CYCLE),
             protocol.build_get_device_info_mask(self._next_seq(), protocol.DEV_INFO_BIT_ANC),
             protocol.build_get_device_info_mask(self._next_seq(), protocol.DEV_INFO_BIT_BATTERY),
         ]
@@ -907,7 +909,7 @@ class RedmiNeoDaemon:
             self.refresh_bluez(force_codec=True)
             if self._ensure_rcsp_ready(timeout=1.2):
                 self._query_initial_device_state()
-                time.sleep(0.25)
+                time.sleep(0.4)
             with self._lock:
                 return dict(self.state)
 

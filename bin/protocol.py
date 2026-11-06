@@ -139,27 +139,41 @@ EQ_FREQUENCIES = (62, 125, 250, 500, 1000, 2016, 4000, 8000, 12000, 16000)
 EQ_GAIN_MIN = -6
 EQ_GAIN_MAX = 6
 
-# Gesture / MFB Button Mapping (CFG_GESTURES 0x02)
+# Gesture / MFB Button Mapping (CFG_GESTURES 0x02, REDMI Headphones Neo 5-byte format: 00 01 <slot> 00 <action>)
+# Catalog func 4018 (single=0x01), 4012 (double=0x02), 4013 (triple=0x03), 4014 (long=0x04)
 GESTURE_SLOT_TO_BYTE = {
-    "single": 0x04,
-    "double": 0x01,
-    "triple": 0x02,
-    "long": 0x03,
+    "single": 0x01,
+    "double": 0x02,
+    "triple": 0x03,
+    "long": 0x04,
 }
 BYTE_TO_GESTURE_SLOT = {v: k for k, v in GESTURE_SLOT_TO_BYTE.items()}
 
 GESTURE_ACTION_TO_BYTE = {
     "voice_assistant": 0x00,
     "play_pause": 0x01,
-    "previous": 0x02,
-    "next": 0x03,
-    "volume_up": 0x04,
-    "volume_down": 0x05,
-    "anc_cycle": 0x06,
-    "game_mode": 0x07,
-    "none": 0x08,
+    "volume_up": 0x02,
+    "volume_down": 0x03,
+    "previous": 0x04,
+    "next": 0x05,
+    "game_mode": 0x0D,
+    "anc_cycle": 0x0F,
+    "none": 0x10,
 }
-BYTE_TO_GESTURE_ACTION = {v: k for k, v in GESTURE_ACTION_TO_BYTE.items()}
+BYTE_TO_GESTURE_ACTION = {
+    0x00: "voice_assistant",
+    0x01: "play_pause",
+    0x02: "volume_up",
+    0x03: "volume_down",
+    0x04: "previous",
+    0x05: "next",
+    0x06: "anc_cycle",
+    0x07: "game_mode",
+    0x08: "none",
+    0x0D: "game_mode",
+    0x0F: "anc_cycle",
+    0x10: "none",
+}
 
 # Long-Press ANC Cycle Mask (CFG_ANC_CYCLE 0x0A: bit0=ANC, bit1=Transparency, bit2=Off)
 ANC_CYCLE_TO_BYTE = {
@@ -583,16 +597,16 @@ def build_set_gesture(seq: int, slot: str, action: str, right_action: str | None
         raise ValueError(f"Unknown gesture slot: {slot}")
     if action not in GESTURE_ACTION_TO_BYTE:
         raise ValueError(f"Unknown gesture action: {action}")
-    r_act = right_action if right_action is not None else action
-    if r_act not in GESTURE_ACTION_TO_BYTE:
-        raise ValueError(f"Unknown right gesture action: {r_act}")
+    # REDMI Headphones Neo (miwear.headphone.o70cg / 0x50F0) 5-byte MFB gesture record: 00 01 <slot> 00 <action>
     return build_set_config(
         seq,
         CFG_GESTURES,
         bytes([
+            0x00,
+            0x01,
             GESTURE_SLOT_TO_BYTE[slot],
+            0x00,
             GESTURE_ACTION_TO_BYTE[action],
-            GESTURE_ACTION_TO_BYTE[r_act],
         ]),
     )
 
@@ -745,12 +759,20 @@ def parse_config_records(payload: bytes) -> dict[str, Any]:
 
         if cfg_id == CFG_GESTURES and len(val) >= 3:
             gestures = dict(updates.get("gestures") or {})
-            for offset in range(0, len(val) - 2, 3):
-                slot = BYTE_TO_GESTURE_SLOT.get(val[offset])
-                act_byte = val[offset + 1] if val[offset + 1] != 0xFF else val[offset + 2]
-                action = BYTE_TO_GESTURE_ACTION.get(act_byte)
-                if slot and action:
-                    gestures[slot] = action
+            if len(val) >= 5 and len(val) % 5 == 0 and val[0:2] == b"\x00\x01":
+                for offset in range(0, len(val) - 4, 5):
+                    slot = BYTE_TO_GESTURE_SLOT.get(val[offset + 2])
+                    act_byte = val[offset + 4] if val[offset + 4] != 0xFF else val[offset + 3]
+                    action = BYTE_TO_GESTURE_ACTION.get(act_byte)
+                    if slot and action:
+                        gestures[slot] = action
+            else:
+                for offset in range(0, len(val) - 2, 3):
+                    slot = BYTE_TO_GESTURE_SLOT.get(val[offset])
+                    act_byte = val[offset + 1] if val[offset + 1] != 0xFF else val[offset + 2]
+                    action = BYTE_TO_GESTURE_ACTION.get(act_byte)
+                    if slot and action:
+                        gestures[slot] = action
             if gestures:
                 updates["gestures"] = gestures
 
