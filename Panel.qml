@@ -538,7 +538,7 @@ Panel {
       foreground: panel.fgColor
       accent: panel.accColor
       fontFamily: panel.fontFam
-      onSelected: function(v) { panel.setAncMode(v); }
+      onChanged: function(v) { panel.setAncMode(v); }
     }
 
     // ANC Strength Level (Light / Balanced / Deep) + Adaptive ANC when ANC is active
@@ -560,7 +560,7 @@ Panel {
         foreground: panel.fgColor
         accent: panel.accColor
         fontFamily: panel.fontFam
-        onSelected: function(v) { panel.setAncLevel(v); }
+        onChanged: function(v) { panel.setAncLevel(v); }
       }
 
       Toggle {
@@ -570,7 +570,7 @@ Panel {
         foreground: panel.fgColor
         accent: panel.accColor
         fontFamily: panel.fontFam
-        onToggled: function(v) { panel.setAdaptiveAnc(v); }
+        onClicked: panel.setAdaptiveAnc(!panel.adaptiveAnc)
       }
     }
 
@@ -593,7 +593,7 @@ Panel {
         foreground: panel.fgColor
         accent: panel.accColor
         fontFamily: panel.fontFam
-        onSelected: function(v) { panel.setTransLevel(v); }
+        onChanged: function(v) { panel.setTransLevel(v); }
       }
     }
 
@@ -613,7 +613,7 @@ Panel {
       foreground: panel.fgColor
       accent: panel.accColor
       fontFamily: panel.fontFam
-      onSelected: function(v) { panel.setEqPreset(v); }
+      onChanged: function(v) { panel.setEqPreset(v); }
     }
 
     // 10-Band Custom Equalizer Sliders (shown when Custom EQ is selected)
@@ -735,9 +735,9 @@ Panel {
       foreground: panel.fgColor
       accent: panel.accColor
       fontFamily: panel.fontFam
-      onToggled: function(v) {
-        panel.multipoint = v;
-        panel.runCtl(["multipoint", v ? "on" : "off"]);
+      onClicked: {
+        panel.multipoint = !panel.multipoint;
+        panel.runCtl(["multipoint", panel.multipoint ? "on" : "off"]);
       }
     }
 
@@ -748,9 +748,9 @@ Panel {
       foreground: panel.fgColor
       accent: panel.accColor
       fontFamily: panel.fontFam
-      onToggled: function(v) {
-        panel.gameMode = v;
-        panel.runCtl(["game-mode", v ? "on" : "off"]);
+      onClicked: {
+        panel.gameMode = !panel.gameMode;
+        panel.runCtl(["game-mode", panel.gameMode ? "on" : "off"]);
       }
     }
 
@@ -761,9 +761,9 @@ Panel {
       foreground: panel.fgColor
       accent: panel.accColor
       fontFamily: panel.fontFam
-      onToggled: function(v) {
-        panel.autoAnswer = v;
-        panel.runCtl(["auto-answer", v ? "on" : "off"]);
+      onClicked: {
+        panel.autoAnswer = !panel.autoAnswer;
+        panel.runCtl(["auto-answer", panel.autoAnswer ? "on" : "off"]);
       }
     }
 
@@ -876,7 +876,7 @@ Panel {
         foreground: panel.fgColor
         accent: panel.accColor
         fontFamily: panel.fontFam
-        onSelected: function(v) {
+        onChanged: function(v) {
           panel.ancCycle = v;
           panel.runCtl(["anc-cycle", v]);
         }
