@@ -8,6 +8,8 @@ import "Model.js" as Model
 
 Panel {
   id: panel
+  moduleName: "0xakadev.redmi-neo"
+  ipcTarget: "0xakadev.redmi-neo"
 
   // ── State Properties ──
   property bool connected: false
@@ -55,10 +57,12 @@ Panel {
   property bool showGestures: false
 
   readonly property string ctlBin: Qt.resolvedUrl("bin/redmictl").toString().replace(/^file:\/\//, "")
-  readonly property color dimColor: panel.bar ? Qt.darker(panel.bar.foreground, 1.45) : "#888888"
-  readonly property color subtleBg: panel.bar
-    ? Qt.rgba(panel.bar.foreground.r, panel.bar.foreground.g, panel.bar.foreground.b, 0.06)
-    : "#1affffff"
+  readonly property color fgColor: bar ? bar.foreground : Commons.Color.foreground
+  readonly property color accColor: bar ? bar.accent : Commons.Color.accent
+  readonly property color urgColor: bar ? bar.urgent : Commons.Color.urgent
+  readonly property string fontFam: bar ? bar.fontFamily : Style.font.family
+  readonly property color dimColor: Qt.darker(fgColor, 1.45)
+  readonly property color subtleBg: Qt.rgba(fgColor.r, fgColor.g, fgColor.b, 0.06)
 
   Commons.Translations {
     id: strings
@@ -217,7 +221,7 @@ Panel {
   }
 
   Timer {
-    interval: panel.showOverlay ? 3000 : 8000
+    interval: panel.opened ? 3000 : 8000
     running: true
     repeat: true
     triggeredOnStart: true
@@ -234,40 +238,74 @@ Panel {
     }
   }
 
+  implicitWidth: barBtn.implicitWidth
+  implicitHeight: barBtn.implicitHeight
+
   // ── Bar Trigger Widget ──
   BarIconButton {
     id: barBtn
+    anchors.fill: parent
     bar: panel.bar
-    active: panel.showOverlay || panel.connected
-    iconText: Model.barIcon(panel.connected, panel.anc, panel.finding)
-    onClicked: {
-      panel.toggle(barBtn);
-      if (panel.showOverlay) panel.refresh(false);
+    active: panel.opened || panel.connected
+    text: Model.barIcon(panel.connected, panel.anc, panel.finding)
+    tooltipText: {
+      var status = panel.connected
+        ? (panel.tr("status.connected") + (panel.battery >= 0 ? (" · " + Model.formatBattery(panel.battery)) : ""))
+        : panel.tr("status.disconnected");
+      return Model.neutralizeMarkup(panel.deviceName + " — " + status);
     }
-    onRightClicked: {
-      if (panel.connected) panel.cycleAncMode();
-      else panel.toggleConnection();
+    onPressed: function(buttonCode) {
+      if (buttonCode === Qt.RightButton || buttonCode === Qt.MiddleButton) {
+        if (panel.connected) panel.cycleAncMode();
+        else panel.toggleConnection();
+      } else {
+        panel.toggle();
+        if (panel.opened) panel.refresh(false);
+      }
     }
   }
 
   // ── Popup Panel Overlay ──
-  overlay: KeyboardPanel {
+  KeyboardPanel {
     id: kbPanel
+    anchorItem: barBtn
+    owner: panel
     bar: panel.bar
-    panelWidth: Style.space(350)
+    open: panel.opened
+    focusTarget: keyCatcher
+    contentWidth: kbPanel.fittedContentWidth(Style.space(350))
+    contentHeight: kbPanel.fittedContentHeight(column.implicitHeight, Style.space(680))
 
-    onKeyPressed: function(event) {
-      if (event.text === "n") {
-        panel.cycleAncMode();
-        event.accepted = true;
-      } else if (event.text === "r") {
-        panel.refresh(true);
-        event.accepted = true;
-      } else if (event.text === "c") {
-        panel.toggleConnection();
-        event.accepted = true;
+    PanelKeyCatcher {
+      id: keyCatcher
+      anchors.fill: parent
+
+      onCloseRequested: panel.close()
+      onTabRequested: function(direction) { panel.switchPanel(direction) }
+      onTextKey: function(t) {
+        if (t === "n" || t === "N") {
+          panel.cycleAncMode();
+        } else if (t === "r" || t === "R") {
+          panel.refresh(true);
+        } else if (t === "c" || t === "C") {
+          panel.toggleConnection();
+        }
       }
-    }
+
+      Flickable {
+        id: panelFlick
+        anchors.fill: parent
+        contentWidth: width
+        contentHeight: column.implicitHeight
+        clip: true
+        boundsBehavior: Flickable.StopAtBounds
+        flickableDirection: Flickable.VerticalFlick
+        interactive: contentHeight > height
+
+        Column {
+          id: column
+          width: panelFlick.width
+          spacing: Style.spacing.md
 
     // ── Header Row ──
     Item {
@@ -286,8 +324,8 @@ Panel {
           textFormat: Text.PlainText
           anchors.verticalCenter: parent.verticalCenter
           text: Model.barIcon(panel.connected, panel.anc, panel.finding)
-          color: panel.connected ? panel.bar.accent : panel.dimColor
-          font.family: panel.bar.fontFamily
+          color: panel.connected ? panel.accColor : panel.dimColor
+          font.family: panel.fontFam
           font.pixelSize: Style.font.iconLarge
         }
 
@@ -301,8 +339,8 @@ Panel {
             textFormat: Text.PlainText
             width: parent.width
             text: Model.neutralizeMarkup(panel.deviceName || panel.tr("title"))
-            color: panel.bar.foreground
-            font.family: panel.bar.fontFamily
+            color: panel.fgColor
+            font.family: panel.fontFam
             font.pixelSize: Style.font.heading
             font.bold: true
             elide: Text.ElideRight
@@ -322,8 +360,8 @@ Panel {
               if (panel.firmware !== "") parts.push("v" + panel.firmware);
               return Model.neutralizeMarkup(parts.join(" · "));
             }
-            color: panel.connected ? panel.bar.accent : panel.dimColor
-            font.family: panel.bar.fontFamily
+            color: panel.connected ? panel.accColor : panel.dimColor
+            font.family: panel.fontFam
             font.pixelSize: Style.font.caption
             font.bold: true
             elide: Text.ElideRight
@@ -347,9 +385,9 @@ Panel {
           iconSpinning: panel.connecting
           bordered: true
           selected: panel.connected
-          foreground: panel.bar.foreground
-          accent: panel.bar.accent
-          fontFamily: panel.bar.fontFamily
+          foreground: panel.fgColor
+          accent: panel.accColor
+          fontFamily: panel.fontFam
           fontSize: Style.font.caption
           horizontalPadding: Style.spacing.sm
           verticalPadding: Style.space(4)
@@ -359,8 +397,8 @@ Panel {
         PanelActionButton {
           iconText: "󰑐"
           tooltipText: Model.neutralizeMarkup(panel.tr("action.refresh"))
-          foreground: panel.bar.foreground
-          fontFamily: panel.bar.fontFamily
+          foreground: panel.fgColor
+          fontFamily: panel.fontFam
           onClicked: panel.refresh(true)
         }
       }
@@ -392,9 +430,9 @@ Panel {
             anchors.verticalCenter: parent.verticalCenter
             text: Model.batteryGlyph(panel.battery, panel.charging)
             color: (panel.battery >= 0 && panel.battery <= 15 && !panel.charging)
-              ? panel.bar.urgent
-              : (panel.charging ? panel.bar.accent : panel.bar.foreground)
-            font.family: panel.bar.fontFamily
+              ? panel.urgColor
+              : (panel.charging ? panel.accColor : panel.fgColor)
+            font.family: panel.fontFam
             font.pixelSize: Style.font.icon
           }
 
@@ -402,8 +440,8 @@ Panel {
             textFormat: Text.PlainText
             anchors.verticalCenter: parent.verticalCenter
             text: Model.neutralizeMarkup(panel.tr("battery.headset") + "  " + Model.formatBattery(panel.battery))
-            color: panel.bar.foreground
-            font.family: panel.bar.fontFamily
+            color: panel.fgColor
+            font.family: panel.fontFam
             font.pixelSize: Style.font.body
             font.bold: true
           }
@@ -419,8 +457,8 @@ Panel {
                     ? ("· " + panel.tr("status.beacon"))
                     : (panel.rcspConnected ? ("· " + panel.tr("status.rcsp_live")) : ""))
             )
-            color: panel.charging ? panel.bar.accent : panel.dimColor
-            font.family: panel.bar.fontFamily
+            color: panel.charging ? panel.accColor : panel.dimColor
+            font.family: panel.fontFam
             font.pixelSize: Style.font.caption
           }
         }
@@ -430,15 +468,15 @@ Panel {
           width: parent.width
           height: Style.space(6)
           radius: height / 2
-          color: Qt.rgba(panel.bar.foreground.r, panel.bar.foreground.g, panel.bar.foreground.b, 0.14)
+          color: Qt.rgba(panel.fgColor.r, panel.fgColor.g, panel.fgColor.b, 0.14)
 
           Rectangle {
             width: parent.width * Math.max(0, Math.min(1, panel.battery / 100.0))
             height: parent.height
             radius: parent.radius
             color: (panel.battery <= 15 && !panel.charging)
-              ? panel.bar.urgent
-              : panel.bar.accent
+              ? panel.urgColor
+              : panel.accColor
 
             Behavior on width {
               NumberAnimation {
@@ -459,7 +497,7 @@ Panel {
             visible: panel.batteryLeft >= 0
             text: Model.neutralizeMarkup(panel.tr("battery.left") + ": " + Model.formatBattery(panel.batteryLeft))
             color: panel.dimColor
-            font.family: panel.bar.fontFamily
+            font.family: panel.fontFam
             font.pixelSize: Style.font.caption
           }
 
@@ -468,7 +506,7 @@ Panel {
             visible: panel.batteryRight >= 0
             text: Model.neutralizeMarkup(panel.tr("battery.right") + ": " + Model.formatBattery(panel.batteryRight))
             color: panel.dimColor
-            font.family: panel.bar.fontFamily
+            font.family: panel.fontFam
             font.pixelSize: Style.font.caption
           }
 
@@ -477,29 +515,29 @@ Panel {
             visible: panel.batteryCase >= 0
             text: Model.neutralizeMarkup(panel.tr("battery.case") + ": " + Model.formatBattery(panel.batteryCase))
             color: panel.dimColor
-            font.family: panel.bar.fontFamily
+            font.family: panel.fontFam
             font.pixelSize: Style.font.caption
           }
         }
       }
     }
 
-    PanelSeparator { foreground: panel.bar.foreground }
+    PanelSeparator { foreground: panel.fgColor }
 
     // ── Noise Control (ANC / Transparency / Off) ──
     PanelSectionHeader {
       text: Model.neutralizeMarkup(panel.tr("section.anc"))
-      foreground: panel.bar.foreground
-      fontFamily: panel.bar.fontFamily
+      foreground: panel.fgColor
+      fontFamily: panel.fontFam
     }
 
     ButtonGroup {
       width: parent.width
       options: Model.ancOptions(panel.tr)
       value: panel.anc
-      foreground: panel.bar.foreground
-      accent: panel.bar.accent
-      fontFamily: panel.bar.fontFamily
+      foreground: panel.fgColor
+      accent: panel.accColor
+      fontFamily: panel.fontFam
       onSelected: function(v) { panel.setAncMode(v); }
     }
 
@@ -511,17 +549,17 @@ Panel {
 
       PanelSectionHeader {
         text: Model.neutralizeMarkup(panel.tr("section.anc_level"))
-        foreground: panel.bar.foreground
-        fontFamily: panel.bar.fontFamily
+        foreground: panel.fgColor
+        fontFamily: panel.fontFam
       }
 
       ButtonGroup {
         width: parent.width
         options: Model.ancLevelOptions(panel.tr)
         value: panel.ancLevel
-        foreground: panel.bar.foreground
-        accent: panel.bar.accent
-        fontFamily: panel.bar.fontFamily
+        foreground: panel.fgColor
+        accent: panel.accColor
+        fontFamily: panel.fontFam
         onSelected: function(v) { panel.setAncLevel(v); }
       }
 
@@ -529,9 +567,9 @@ Panel {
         width: parent.width
         label: Model.neutralizeMarkup(panel.tr("anc.adaptive"))
         checked: panel.adaptiveAnc
-        foreground: panel.bar.foreground
-        accent: panel.bar.accent
-        fontFamily: panel.bar.fontFamily
+        foreground: panel.fgColor
+        accent: panel.accColor
+        fontFamily: panel.fontFam
         onToggled: function(v) { panel.setAdaptiveAnc(v); }
       }
     }
@@ -544,37 +582,37 @@ Panel {
 
       PanelSectionHeader {
         text: Model.neutralizeMarkup(panel.tr("section.trans_level"))
-        foreground: panel.bar.foreground
-        fontFamily: panel.bar.fontFamily
+        foreground: panel.fgColor
+        fontFamily: panel.fontFam
       }
 
       ButtonGroup {
         width: parent.width
         options: Model.transLevelOptions(panel.tr)
         value: panel.transLevel
-        foreground: panel.bar.foreground
-        accent: panel.bar.accent
-        fontFamily: panel.bar.fontFamily
+        foreground: panel.fgColor
+        accent: panel.accColor
+        fontFamily: panel.fontFam
         onSelected: function(v) { panel.setTransLevel(v); }
       }
     }
 
-    PanelSeparator { foreground: panel.bar.foreground }
+    PanelSeparator { foreground: panel.fgColor }
 
     // ── Equalizer Presets & 10-Band Custom EQ ──
     PanelSectionHeader {
       text: Model.neutralizeMarkup(panel.tr("section.eq"))
-      foreground: panel.bar.foreground
-      fontFamily: panel.bar.fontFamily
+      foreground: panel.fgColor
+      fontFamily: panel.fontFam
     }
 
     ButtonGroup {
       width: parent.width
       options: Model.eqOptions(panel.tr)
       value: panel.eq
-      foreground: panel.bar.foreground
-      accent: panel.bar.accent
-      fontFamily: panel.bar.fontFamily
+      foreground: panel.fgColor
+      accent: panel.accColor
+      fontFamily: panel.fontFam
       onSelected: function(v) { panel.setEqPreset(v); }
     }
 
@@ -595,7 +633,7 @@ Panel {
           anchors.verticalCenter: parent.verticalCenter
           text: Model.neutralizeMarkup(panel.tr("eq.custom_bands"))
           color: panel.dimColor
-          font.family: panel.bar.fontFamily
+          font.family: panel.fontFam
           font.pixelSize: Style.font.caption
           font.bold: true
         }
@@ -606,9 +644,9 @@ Panel {
           anchors.verticalCenter: parent.verticalCenter
           text: Model.neutralizeMarkup(panel.tr("eq.reset"))
           bordered: true
-          foreground: panel.bar.foreground
-          accent: panel.bar.accent
-          fontFamily: panel.bar.fontFamily
+          foreground: panel.fgColor
+          accent: panel.accColor
+          fontFamily: panel.fontFam
           fontSize: Style.font.caption
           horizontalPadding: Style.spacing.sm
           verticalPadding: Style.space(2)
@@ -639,7 +677,7 @@ Panel {
             anchors.verticalCenter: parent.verticalCenter
             text: Model.neutralizeMarkup(Model.formatFreqLabel(parent.bandFreq) + "Hz")
             color: panel.dimColor
-            font.family: panel.bar.fontFamily
+            font.family: panel.fontFam
             font.pixelSize: Style.font.caption
           }
 
@@ -673,30 +711,30 @@ Panel {
             anchors.verticalCenter: parent.verticalCenter
             horizontalAlignment: Text.AlignRight
             text: Model.neutralizeMarkup(Model.formatGainDb(bandSlider.dragging ? bandSlider.liveValue : parent.bandGain))
-            color: panel.bar.foreground
-            font.family: panel.bar.fontFamily
+            color: panel.fgColor
+            font.family: panel.fontFam
             font.pixelSize: Style.font.caption
           }
         }
       }
     }
 
-    PanelSeparator { foreground: panel.bar.foreground }
+    PanelSeparator { foreground: panel.fgColor }
 
     // ── Device Features & Controls ──
     PanelSectionHeader {
       text: Model.neutralizeMarkup(panel.tr("section.features"))
-      foreground: panel.bar.foreground
-      fontFamily: panel.bar.fontFamily
+      foreground: panel.fgColor
+      fontFamily: panel.fontFam
     }
 
     Toggle {
       width: parent.width
       label: Model.neutralizeMarkup(panel.tr("feature.multipoint"))
       checked: panel.multipoint
-      foreground: panel.bar.foreground
-      accent: panel.bar.accent
-      fontFamily: panel.bar.fontFamily
+      foreground: panel.fgColor
+      accent: panel.accColor
+      fontFamily: panel.fontFam
       onToggled: function(v) {
         panel.multipoint = v;
         panel.runCtl(["multipoint", v ? "on" : "off"]);
@@ -707,9 +745,9 @@ Panel {
       width: parent.width
       label: Model.neutralizeMarkup(panel.tr("feature.game_mode"))
       checked: panel.gameMode
-      foreground: panel.bar.foreground
-      accent: panel.bar.accent
-      fontFamily: panel.bar.fontFamily
+      foreground: panel.fgColor
+      accent: panel.accColor
+      fontFamily: panel.fontFam
       onToggled: function(v) {
         panel.gameMode = v;
         panel.runCtl(["game-mode", v ? "on" : "off"]);
@@ -720,9 +758,9 @@ Panel {
       width: parent.width
       label: Model.neutralizeMarkup(panel.tr("feature.auto_answer"))
       checked: panel.autoAnswer
-      foreground: panel.bar.foreground
-      accent: panel.bar.accent
-      fontFamily: panel.bar.fontFamily
+      foreground: panel.fgColor
+      accent: panel.accColor
+      fontFamily: panel.fontFam
       onToggled: function(v) {
         panel.autoAnswer = v;
         panel.runCtl(["auto-answer", v ? "on" : "off"]);
@@ -740,8 +778,8 @@ Panel {
         anchors.left: parent.left
         anchors.verticalCenter: parent.verticalCenter
         text: Model.neutralizeMarkup(panel.tr("feature.find"))
-        color: panel.bar.foreground
-        font.family: panel.bar.fontFamily
+        color: panel.fgColor
+        font.family: panel.fontFam
         font.pixelSize: Style.font.body
       }
 
@@ -753,9 +791,9 @@ Panel {
         text: Model.neutralizeMarkup(panel.finding ? panel.tr("feature.find_stop") : panel.tr("feature.find_ring"))
         selected: panel.finding
         bordered: true
-        foreground: panel.bar.foreground
-        accent: panel.bar.accent
-        fontFamily: panel.bar.fontFamily
+        foreground: panel.fgColor
+        accent: panel.accColor
+        fontFamily: panel.fontFam
         fontSize: Style.font.caption
         horizontalPadding: Style.spacing.sm
         verticalPadding: Style.space(4)
@@ -766,7 +804,7 @@ Panel {
       }
     }
 
-    PanelSeparator { foreground: panel.bar.foreground }
+    PanelSeparator { foreground: panel.fgColor }
 
     // ── Collapsible MFB Button Controls Section ──
     Button {
@@ -774,9 +812,9 @@ Panel {
       leftAlign: true
       iconText: panel.showGestures ? "󰅀" : "󰅂"
       text: Model.neutralizeMarkup(panel.tr("section.gestures"))
-      foreground: panel.bar.foreground
-      accent: panel.bar.accent
-      fontFamily: panel.bar.fontFamily
+      foreground: panel.fgColor
+      accent: panel.accColor
+      fontFamily: panel.fontFam
       fontSize: Style.font.caption
       onClicked: panel.showGestures = !panel.showGestures
     }
@@ -801,7 +839,7 @@ Panel {
             anchors.verticalCenter: parent.verticalCenter
             text: Model.neutralizeMarkup(modelData.label)
             color: panel.dimColor
-            font.family: panel.bar.fontFamily
+            font.family: panel.fontFam
             font.pixelSize: Style.font.bodySmall
           }
 
@@ -811,9 +849,9 @@ Panel {
             anchors.verticalCenter: parent.verticalCenter
             bordered: true
             text: Model.neutralizeMarkup(panel.gestureActionLabel(modelData.key))
-            foreground: panel.bar.foreground
-            accent: panel.bar.accent
-            fontFamily: panel.bar.fontFamily
+            foreground: panel.fgColor
+            accent: panel.accColor
+            fontFamily: panel.fontFam
             fontSize: Style.font.caption
             horizontalPadding: Style.spacing.sm
             verticalPadding: Style.space(3)
@@ -827,7 +865,7 @@ Panel {
         textFormat: Text.PlainText
         text: Model.neutralizeMarkup(panel.tr("gesture.anc_cycle"))
         color: panel.dimColor
-        font.family: panel.bar.fontFamily
+        font.family: panel.fontFam
         font.pixelSize: Style.font.caption
       }
 
@@ -835,9 +873,9 @@ Panel {
         width: parent.width
         options: Model.ancCycleOptions(panel.tr)
         value: panel.ancCycle
-        foreground: panel.bar.foreground
-        accent: panel.bar.accent
-        fontFamily: panel.bar.fontFamily
+        foreground: panel.fgColor
+        accent: panel.accColor
+        fontFamily: panel.fontFam
         onSelected: function(v) {
           panel.ancCycle = v;
           panel.runCtl(["anc-cycle", v]);
@@ -851,10 +889,13 @@ Panel {
       visible: panel.errorText !== ""
       width: parent.width
       text: Model.neutralizeMarkup(panel.errorText)
-      color: panel.bar.urgent
-      font.family: panel.bar.fontFamily
+      color: panel.urgColor
+      font.family: panel.fontFam
       font.pixelSize: Style.font.caption
       wrapMode: Text.WordWrap
+    }
+        }
+      }
     }
   }
 }
