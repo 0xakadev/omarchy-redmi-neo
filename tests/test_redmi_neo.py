@@ -232,12 +232,51 @@ class TestRcspProtocolAndCommands(unittest.TestCase):
         assert mask_batt is not None
         self.assertEqual(mask_batt.payload, b"\x00\x00\x00\x80")
 
-        # Hardware response for mask 4 (ANC mode = Transparency 0x02) and mask 7 (Battery 90% in slot 1)
-        dev_anc = protocol.parse_device_info_tlvs(bytes.fromhex("020402"))
-        self.assertEqual(dev_anc["anc"], "transparency")
+        # Hardware response for mask 4 (TLV 0x04 = constant ANC capability flag, NOT live mode)
+        # and mask 7 (Battery 90% in slot 1)
+        dev_anc = protocol.parse_device_info_tlvs(bytes.fromhex("020401"))
+        self.assertTrue(dev_anc["anc_available"])
+        self.assertNotIn("anc", dev_anc)
         dev_batt = protocol.parse_device_info_tlvs(bytes.fromhex("0407ff5aff"))
         self.assertEqual(dev_batt["battery"], 90)
         self.assertFalse(dev_batt["charging"])
+
+    def test_hardware_eq_curve_and_transparency_mode_regressions(self) -> None:
+        # Exact 0x37 custom EQ response captured from REDMI Headphones Neo (preset=0x0A, curve_idx=0x00, 2000Hz band 6)
+        hw_custom_eq = bytes.fromhex(
+            "270037010a060600000a003e01007d0200fa0301f40003e88107d0820fa0001f40012ee0023e8003"
+        )
+        parsed_custom = protocol.parse_config_records(hw_custom_eq)
+        self.assertEqual(parsed_custom.get("eq_bands"), [1, 2, 3, 0, -1, -2, 0, 1, 2, 3])
+
+        # Non-custom preset curve (e.g. Voice preset=0x01) must NOT overwrite custom eq_bands
+        hw_voice_eq = bytes.fromhex(
+            "2700370101060600000a003e06007d0600fa0601f40603e80607d0060fa0061f40062ee0063e8086"
+        )
+        parsed_voice = protocol.parse_config_records(hw_voice_eq)
+        self.assertNotIn("eq_bands", parsed_voice)
+
+        # CFG_EFFECT_STRENGTH (0x0B) in Transparency (02 00 or transient 02 02) must NOT clobber trans_level;
+        # CFG_TRANS_MODE (0x23) is the authoritative Transparency sub-mode register.
+        eff_trans_00 = protocol.parse_config_records(bytes.fromhex("04000b0200"))
+        self.assertEqual(eff_trans_00, {"anc": "transparency"})
+        eff_trans_02 = protocol.parse_config_records(bytes.fromhex("04000b0202"))
+        self.assertEqual(eff_trans_02, {"anc": "transparency"})
+        self.assertEqual(protocol.parse_config_records(bytes.fromhex("03002300")), {"trans_level": "regular"})
+        self.assertEqual(protocol.parse_config_records(bytes.fromhex("03002301")), {"trans_level": "voice"})
+        self.assertEqual(protocol.parse_config_records(bytes.fromhex("03002302")), {"trans_level": "ambient"})
+
+    def test_stream_parsers_bound_memory_on_malformed_input(self) -> None:
+        rcsp_parser = protocol.RcspStreamParser()
+        # Feed 32 KiB of unframed header-like bytes without tail; internal buffer must stay bounded
+        for _ in range(32):
+            rcsp_parser.feed(protocol.FRAME_HEAD + b"\x04\xf3\x07\xd0" + (b"\xAA" * 1017))
+        self.assertLessEqual(len(rcsp_parser._buf), protocol.RcspStreamParser.MAX_BUFFER_BYTES)
+
+        fp_parser = protocol.FastPairStreamParser()
+        for _ in range(32):
+            fp_parser.feed(b"\x03\x03\x02\x00" + (b"\xBB" * 250))
+        self.assertLessEqual(len(fp_parser._buf), protocol.FastPairStreamParser.MAX_BUFFER_BYTES)
 
     def test_live_redmi_neo_manufacturer_data_parsing(self) -> None:
         # Exact ManufacturerData captured from user's REDMI Headphones Neo (A0:90:B5:F8:E2:A7)
@@ -474,6 +513,78 @@ class TestSdpRecordCleanup(unittest.TestCase):
         self.assertEqual(len(fake_err.active_records), 0)
         self.assertEqual(len(fake_err.active_lists), 0)
         self.assertEqual(fake_err.closed_sessions, [0x5E5510])
+
+
+class TestDaemonStateSyncAndPipewireCodec(unittest.TestCase):
+    def test_pipewire_a2dp_sink_aac_codec_parsing(self) -> None:
+        from unittest import mock
+
+        sample_pactl = (
+            "Card #64\n"
+            "\tName: bluez_card.A0_90_B5_F8_E2_A7\n"
+            "\tProperties:\n"
+            '\t\tapi.bluez5.address = "A0:90:B5:F8_E2:A7"\n'
+            "\tProfiles:\n"
+            "\t\toff: Off (sinks: 0, sources: 0, priority: 0, available: yes)\n"
+            "\t\ta2dp-sink-sbc: High Fidelity Playback (A2DP Sink, codec SBC) (sinks: 1, sources: 0, priority: 131, available: yes)\n"
+            "\t\ta2dp-sink: High Fidelity Playback (A2DP Sink, codec AAC) (sinks: 1, sources: 0, priority: 132, available: yes)\n"
+            "\tActive Profile: a2dp-sink\n"
+        )
+        fake_proc = mock.Mock(returncode=0, stdout=sample_pactl)
+        with mock.patch.object(redmid.subprocess, "run", return_value=fake_proc):
+            info = redmid.query_audio_codec("A0:90:B5:F8:E2:A7")
+        self.assertEqual(info, {"codec": "AAC", "profile": "A2DP"})
+
+    def test_stale_read_rejection_and_dsp_settle_guard(self) -> None:
+        from unittest import mock
+
+        with mock.patch.object(redmid, "load_config", return_value={}), mock.patch.object(
+            redmid, "save_config", return_value=None
+        ):
+            daemon = redmid.RedmiNeoDaemon()
+            auth = protocol.CommandAuthSession(daemon._next_seq)
+            daemon._rfcomm_authenticated = True
+
+            # Simulate a background read sent BEFORE a user write
+            daemon._pending_reads[7] = 100.0
+            daemon._last_write_ts = 100.5
+            daemon.state["anc"] = "off"
+
+            stale_pkt = protocol.parse_frame(
+                protocol.build_response(protocol.OP_GET_CONFIG, 7, bytes.fromhex("04000b0100"))
+            )
+            assert stale_pkt is not None
+            daemon._handle_rcsp_packet(stale_pkt, auth)
+            # Stale pre-write read must NOT revert "off" back to "anc"
+            self.assertEqual(daemon.state["anc"], "off")
+
+            # Simulate a read sent AFTER the user write across 256-seq wraparound
+            now = redmid.time.monotonic()
+            daemon._last_write_ts = now - 3.0
+            daemon._pending_reads[7] = now - 0.1
+            fresh_pkt = protocol.parse_frame(
+                protocol.build_response(protocol.OP_GET_CONFIG, 7, bytes.fromhex("04000b0200"))
+            )
+            assert fresh_pkt is not None
+            daemon._handle_rcsp_packet(fresh_pkt, auth)
+            self.assertEqual(daemon.state["anc"], "transparency")
+
+            # During DSP_SETTLE_SEC right after a write, transitional ANC push notifications are ignored
+            # while battery notifications still update in real time
+            daemon._begin_write()
+            daemon.state["anc"] = "off"
+            ntf_pkt = protocol.parse_frame(
+                protocol.build_request(
+                    protocol.OP_REPORT_STATUS,
+                    12,
+                    bytes([0x04, 0x00, 77, 0x7F, 0x7F, 0x02, 0x04, 0x01]),
+                    flags=0x80,
+                )
+            )
+            assert ntf_pkt is not None
+            daemon._handle_rcsp_packet(ntf_pkt, auth)
+            self.assertEqual(daemon.state["anc"], "off")
+            self.assertEqual(daemon.state["battery"], 77)
 
 
 if __name__ == "__main__":

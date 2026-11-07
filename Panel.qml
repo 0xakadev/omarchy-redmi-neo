@@ -37,7 +37,7 @@ Panel {
   // Equalizer
   property string eq: "balanced"
   property var eqBands: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
-  property var eqFrequencies: [62, 125, 250, 500, 1000, 2016, 4000, 8000, 12000, 16000]
+  property var eqFrequencies: [62, 125, 250, 500, 1000, 2000, 4000, 8000, 12000, 16000]
 
   // Features & MFB Controls
   property bool multipoint: false
@@ -53,9 +53,11 @@ Panel {
   property string ancCycle: "all"
   property string errorText: ""
 
-  // UI Accordion States
+  // UI Accordion & Async IPC Synchronization State
   property bool showGestures: false
-  property var pendingArgs: null
+  property int writeGen: 0
+  property double lastWriteMs: 0
+  property var cmdQueue: []
 
   readonly property string ctlBin: Qt.resolvedUrl("bin/redmictl").toString().replace(/^file:\/\//, "")
   readonly property color fgColor: bar ? bar.foreground : Commons.Color.foreground
@@ -127,20 +129,66 @@ Panel {
     }
   }
 
-  function runCtl(args) {
-    var isBgState = (args.length === 1 && args[0] === "state");
-    if (ctlProc.running) {
-      if (!isBgState) {
-        panel.pendingArgs = args;
-      }
+  function _sameCmdTarget(a, b) {
+    if (!a || !b || a.length === 0 || b.length === 0) return false;
+    if (a[0] !== b[0]) return false;
+    if (a[0] === "gesture") return a.length > 1 && b.length > 1 && a[1] === b[1];
+    return true;
+  }
+
+  function _launchNextCmd() {
+    if (cmdProc.running || panel.cmdQueue.length === 0) return;
+    var q = panel.cmdQueue.slice();
+    var next = q.shift();
+    panel.cmdQueue = q;
+    if (next[0] !== "poll" && next[0] !== "scan") {
+      panel.lastWriteMs = Date.now();
+    }
+    cmdProc.startedGen = panel.writeGen;
+    cmdProc.command = [panel.ctlBin].concat(next);
+    cmdProc.running = true;
+  }
+
+  function pollState() {
+    if (stateProc.running || cmdProc.running || panel.cmdQueue.length > 0) {
       return;
     }
-    ctlProc.command = [panel.ctlBin].concat(args);
-    ctlProc.running = true;
+    if ((Date.now() - panel.lastWriteMs) < 950) {
+      return;
+    }
+    stateProc.startedGen = panel.writeGen;
+    stateProc.command = [panel.ctlBin, "state"];
+    stateProc.running = true;
+  }
+
+  function runCtl(args) {
+    if (!args || args.length === 0) return;
+    if (args.length === 1 && args[0] === "state") {
+      pollState();
+      return;
+    }
+    var isWrite = (args[0] !== "poll" && args[0] !== "scan");
+    if (isWrite) {
+      panel.writeGen = panel.writeGen + 1;
+      panel.lastWriteMs = Date.now();
+    }
+    var q = panel.cmdQueue.slice();
+    if (q.length > 0 && _sameCmdTarget(q[q.length - 1], args)) {
+      q[q.length - 1] = args;
+    } else {
+      if (q.length >= 16) q.shift();
+      q.push(args);
+    }
+    panel.cmdQueue = q;
+    _launchNextCmd();
   }
 
   function refresh(forcePoll) {
-    runCtl([forcePoll ? "poll" : "state"]);
+    if (forcePoll) {
+      runCtl(["poll"]);
+    } else {
+      pollState();
+    }
   }
 
   function setAncMode(mode) {
@@ -167,6 +215,9 @@ Panel {
   }
 
   function setAdaptiveAnc(enabled) {
+    if (enabled && panel.anc !== "anc") {
+      panel.anc = "anc";
+    }
     panel.adaptiveAnc = enabled;
     if (!enabled && panel.ancLevel === "adaptive") {
       panel.ancLevel = "balanced";
@@ -227,31 +278,40 @@ Panel {
   }
 
   Process {
-    id: ctlProc
+    id: stateProc
+    property int startedGen: 0
     command: [panel.ctlBin, "state"]
     stdout: StdioCollector {
       onStreamFinished: {
-        if (panel.pendingArgs === null) {
+        if (stateProc.startedGen === panel.writeGen && !cmdProc.running && panel.cmdQueue.length === 0) {
+          panel.applyState(text);
+        }
+      }
+    }
+  }
+
+  Process {
+    id: cmdProc
+    property int startedGen: 0
+    command: [panel.ctlBin, "state"]
+    stdout: StdioCollector {
+      onStreamFinished: {
+        if (cmdProc.startedGen === panel.writeGen && panel.cmdQueue.length === 0) {
           panel.applyState(text);
         }
       }
     }
     onExited: {
-      if (panel.pendingArgs !== null) {
-        var next = panel.pendingArgs;
-        panel.pendingArgs = null;
-        ctlProc.command = [panel.ctlBin].concat(next);
-        ctlProc.running = true;
-      }
+      Qt.callLater(panel._launchNextCmd);
     }
   }
 
   Timer {
-    interval: panel.opened ? 1200 : 2500
+    interval: panel.opened ? 1000 : 2000
     running: true
     repeat: true
     triggeredOnStart: true
-    onTriggered: panel.refresh(false)
+    onTriggered: panel.pollState()
   }
 
   IpcHandler {

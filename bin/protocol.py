@@ -73,6 +73,7 @@ CFG_FIND_DEVICE = 0x09
 CFG_ANC_CYCLE = 0x0A
 CFG_EFFECT_STRENGTH = 0x0B
 CFG_IN_EAR = 0x0C
+CFG_TRANS_MODE = 0x23
 CFG_ADAPTIVE_ANC = 0x25
 CFG_SERIAL_NUMBER = 0x27
 CFG_GAME_MODE = 0x2F
@@ -104,7 +105,7 @@ ANC_LEVEL_TO_BYTE = {
 }
 BYTE_TO_ANC_LEVEL = {v: k for k, v in ANC_LEVEL_TO_BYTE.items()}
 
-# Transparency Sub-Modes (CFG_EFFECT_STRENGTH 0x0B target=0x02, catalog func 1005)
+# Transparency Sub-Modes (CFG_TRANS_MODE 0x23, catalog func 1005)
 TRANS_LEVEL_TO_BYTE = {
     "regular": 0x00,
     "voice": 0x01,
@@ -134,8 +135,8 @@ BYTE_TO_EQ_PRESET = {
     0xFF: "custom",
 }
 
-# 10-band Equalizer Frequencies (Hz)
-EQ_FREQUENCIES = (62, 125, 250, 500, 1000, 2016, 4000, 8000, 12000, 16000)
+# 10-band Equalizer Frequencies (Hz) — hardware-verified on REDMI Headphones Neo (0x50F0)
+EQ_FREQUENCIES = (62, 125, 250, 500, 1000, 2000, 4000, 8000, 12000, 16000)
 EQ_GAIN_MIN = -6
 EQ_GAIN_MAX = 6
 
@@ -375,11 +376,15 @@ def parse_frame(frame: bytes) -> RcspPacket | None:
 class RcspStreamParser:
     """Extracts complete RCSP packets from an arbitrary RFCOMM byte stream."""
 
+    MAX_BUFFER_BYTES = 8192
+
     def __init__(self) -> None:
         self._buf = bytearray()
 
     def feed(self, data: bytes) -> list[RcspPacket]:
         self._buf.extend(data)
+        if len(self._buf) > self.MAX_BUFFER_BYTES:
+            del self._buf[: -2056]
         packets: list[RcspPacket] = []
         while True:
             idx = self._buf.find(FRAME_HEAD)
@@ -526,7 +531,7 @@ def build_set_anc_level(seq: int, level: str) -> bytes:
 def build_set_trans_level(seq: int, level: str) -> bytes:
     if level not in TRANS_LEVEL_TO_BYTE:
         raise ValueError(f"Unknown transparency level: {level}")
-    return build_set_config(seq, CFG_EFFECT_STRENGTH, bytes([0x02, TRANS_LEVEL_TO_BYTE[level]]))
+    return build_set_config(seq, CFG_TRANS_MODE, bytes([TRANS_LEVEL_TO_BYTE[level]]))
 
 
 def build_set_adaptive_anc(seq: int, enabled: bool) -> bytes:
@@ -570,8 +575,9 @@ def decode_eq_gain_byte(raw: int) -> int:
 def build_set_eq_curve(seq: int, bands: list[int], preview: bool = False) -> bytes:
     if len(bands) != 10:
         raise ValueError("Custom EQ curve requires exactly 10 bands")
-    header = bytes.fromhex("05 01 01") if preview else bytes.fromhex("01 0a 01 01 01 00")
-    payload = bytearray(header)
+    # Hardware-verified on REDMI Headphones Neo (0x50F0): 05 01 01 <count=10> (<freq_be16><gain>)*10
+    # writes all 10 custom EQ bands directly to the headset DSP & NVRAM.
+    payload = bytearray(b"\x05\x01\x01")
     payload.append(len(bands))
     for freq, gain in zip(EQ_FREQUENCIES, bands):
         payload.extend(int(freq).to_bytes(2, "big"))
@@ -702,9 +708,11 @@ def parse_device_info_tlvs(payload: bytes) -> dict[str, Any]:
             info["vid"] = f"{vid:04x}"
             info["pid"] = f"{pid:04x}"
         elif tlv_type == 0x04 and len(val) >= 1:
-            mode = BYTE_TO_ANC_MODE.get(val[0])
-            if mode:
-                info["anc"] = mode
+            # Hardware-verified on REDMI Headphones Neo (fw 3.0.2.9): this TLV is a constant
+            # ANC *capability* flag (always 0x01 in Off, ANC and Transparency). It is NOT the
+            # live mode; the live mode comes from CFG_EFFECT_STRENGTH (0xF3/0xF4 0x0B) and
+            # OP_REPORT_STATUS (0x0E). Treating it as the mode reverted the UI to "ANC".
+            info["anc_available"] = val[0] != 0x00
         elif tlv_type == 0x07 and val:
             info.update(parse_battery_bytes(val))
     return info
@@ -733,11 +741,12 @@ def parse_report_status_tlvs(payload: bytes) -> dict[str, Any]:
             mode = BYTE_TO_ANC_MODE.get(val[0])
             if mode:
                 info["anc"] = mode
-            if len(val) >= 2:
-                if info.get("anc") == "anc" and val[1] in BYTE_TO_ANC_LEVEL:
+            if len(val) >= 2 and info.get("anc") == "anc":
+                if val[1] == 0x03:
+                    info["adaptive_anc"] = True
+                elif val[1] in BYTE_TO_ANC_LEVEL:
+                    info["adaptive_anc"] = False
                     info["anc_level"] = BYTE_TO_ANC_LEVEL[val[1]]
-                elif info.get("anc") == "transparency" and val[1] in BYTE_TO_TRANS_LEVEL:
-                    info["trans_level"] = BYTE_TO_TRANS_LEVEL[val[1]]
     return info
 
 
@@ -805,8 +814,10 @@ def parse_config_records(payload: bytes) -> dict[str, Any]:
                 elif strength in BYTE_TO_ANC_LEVEL:
                     updates["adaptive_anc"] = False
                     updates["anc_level"] = BYTE_TO_ANC_LEVEL[strength]
-            elif target == 0x02 and strength in BYTE_TO_TRANS_LEVEL:
-                updates["trans_level"] = BYTE_TO_TRANS_LEVEL[strength]
+
+        elif cfg_id == CFG_TRANS_MODE and len(val) >= 1:
+            if val[0] in BYTE_TO_TRANS_LEVEL:
+                updates["trans_level"] = BYTE_TO_TRANS_LEVEL[val[0]]
 
         elif cfg_id == CFG_ADAPTIVE_ANC and len(val) >= 1:
             updates["adaptive_anc"] = val[0] == 0x01
@@ -826,12 +837,14 @@ def parse_config_records(payload: bytes) -> dict[str, Any]:
             # Handle EQ reset record (04 01 01 01)
             if val == b"\x04\x01\x01\x01":
                 updates["eq_bands"] = [0] * 10
-            # Handle OTA 3-byte-per-band format: 01 0a 01 01 01 <name_len> <name...> <count> (<freq_be16><gain>)*count
-            elif len(val) >= 7 and val[0] == 0x01 and val[4] == 0x01:
+            # Handle hardware 3-byte-per-band response:
+            # 01 <preset_id> <max_gain> <min_gain> <curve_idx> <name_len> <name...> <count=10> (<freq_be16><gain>)*10
+            elif len(val) >= 7 and val[0] == 0x01:
+                preset_byte = val[1]
                 offset = 6 + val[5]
                 if offset < len(val):
                     count = val[offset]
-                    if count == 10 and len(val) >= offset + 1 + 3 * count:
+                    if count == 10 and len(val) >= offset + 1 + 3 * count and preset_byte == 0x0A:
                         gains: list[int] = []
                         for pos in range(offset + 1, offset + 1 + 3 * count, 3):
                             gains.append(decode_eq_gain_byte(val[pos + 2]))
@@ -843,8 +856,8 @@ def parse_config_records(payload: bytes) -> dict[str, Any]:
                         decode_eq_gain_byte(val[pos + 2])
                         for pos in range(4, 4 + 3 * count, 3)
                     ]
-            elif len(val) >= 10:
-                band_bytes = val[1:11] if len(val) >= 11 else val[:10]
+            elif len(val) in (10, 11):
+                band_bytes = val[1:11] if len(val) == 11 else val[:10]
                 updates["eq_bands"] = [decode_eq_gain_byte(b) for b in band_bytes]
 
     return updates
@@ -862,11 +875,15 @@ def build_fastpair_ring(ringing: bool, timeout_sec: int = 30) -> bytes:
 class FastPairStreamParser:
     """Parses Google Fast Pair Message Stream packets ([group:1][code:1][len:be16][data:len])."""
 
+    MAX_BUFFER_BYTES = 2048
+
     def __init__(self) -> None:
         self._buf = bytearray()
 
     def feed(self, data: bytes) -> dict[str, Any]:
         self._buf.extend(data)
+        if len(self._buf) > self.MAX_BUFFER_BYTES:
+            del self._buf[:-516]
         updates: dict[str, Any] = {}
         while len(self._buf) >= 4:
             group, code, length = struct.unpack(">BBH", self._buf[:4])

@@ -116,7 +116,7 @@ def build_command_from_argv(argv: list[str]) -> dict[str, Any]:
         return {"cmd": "state"}
     cmd = argv[0].strip().lower()
 
-    if cmd in ("state", "poll", "scan", "eq-reset"):
+    if cmd in ("state", "poll", "scan", "eq-reset", "quit"):
         return {"cmd": cmd}
 
     if cmd in ("connect", "disconnect"):
@@ -130,12 +130,6 @@ def build_command_from_argv(argv: list[str]) -> dict[str, Any]:
 
     if cmd == "anc" and len(argv) >= 2:
         mode = argv[1].strip().lower()
-        if mode == "cycle":
-            cur = send_request({"cmd": "state"}, timeout=3.0)
-            cur_mode = str(cur.get("anc") or "off")
-            order = ["off", "anc", "transparency"]
-            next_mode = order[(order.index(cur_mode) + 1) % len(order)] if cur_mode in order else "anc"
-            return {"cmd": "anc", "mode": next_mode}
         if mode == "on":
             mode = "anc"
         return {"cmd": "anc", "mode": mode}
