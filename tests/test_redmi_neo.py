@@ -3,6 +3,9 @@
 
 from __future__ import annotations
 
+import ctypes
+import importlib.machinery
+import importlib.util
 from pathlib import Path
 import re
 import sys
@@ -16,6 +19,18 @@ if str(BIN_DIR) not in sys.path:
     sys.path.insert(0, str(BIN_DIR))
 
 import protocol  # noqa: E402
+
+
+def _load_redmid():
+    loader = importlib.machinery.SourceFileLoader("redmid", str(BIN_DIR / "redmid"))
+    spec = importlib.util.spec_from_loader("redmid", loader)
+    assert spec is not None
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+redmid = _load_redmid()
 
 
 class TestSaferPlusAndAuth(unittest.TestCase):
@@ -288,6 +303,177 @@ class TestUiSafetyAndQmlConventions(unittest.TestCase):
         self.assertNotIn(">", safe)
         self.assertNotIn("&", safe)
         self.assertNotIn("\x07", safe)
+
+
+class _FakeCFunc:
+    def __init__(self, fn):
+        self._fn = fn
+        self.argtypes = None
+        self.restype = None
+
+    def __call__(self, *args):
+        return self._fn(*args)
+
+
+class _FakeLibBluetooth:
+    """Fake libbluetooth.so.3 harness tracking every SDP list, record, and session allocation."""
+
+    def __init__(self, records_ports: list[int], search_err: int = 0, raise_on_port: bool = False):
+        self._records_ports = records_ports
+        self._search_err = search_err
+        self._raise_on_port = raise_on_port
+        self._keepalive: list[object] = []
+        self._next_list_id = 1
+        self._ptr_to_list_id: dict[int, int] = {}
+
+        self.active_lists: set[int] = set()
+        self.freed_lists: list[int] = []
+        self.active_records: set[int] = set()
+        self.freed_records: list[int] = []
+        self.access_proto_queries: list[int] = []
+        self.requested_attr_ranges: list[int] = []
+        self.closed_sessions: list[int] = []
+
+        self.sdp_connect = _FakeCFunc(self._sdp_connect)
+        self.sdp_close = _FakeCFunc(self._sdp_close)
+        self.sdp_uuid128_create = _FakeCFunc(self._sdp_uuid128_create)
+        self.sdp_uuid16_create = _FakeCFunc(self._sdp_uuid16_create)
+        self.sdp_list_append = _FakeCFunc(self._sdp_list_append)
+        self.sdp_list_free = _FakeCFunc(self._sdp_list_free)
+        self.sdp_service_search_attr_req = _FakeCFunc(self._sdp_service_search_attr_req)
+        self.sdp_get_access_protos = _FakeCFunc(self._sdp_get_access_protos)
+        self.sdp_get_proto_port = _FakeCFunc(self._sdp_get_proto_port)
+        self.sdp_record_free = _FakeCFunc(self._sdp_record_free)
+
+    def _alloc_chain(self, values: list[int]) -> ctypes.POINTER(redmid._sdp_list_t):
+        head = ctypes.POINTER(redmid._sdp_list_t)()
+        prev = None
+        nodes = []
+        for val in values:
+            node = redmid._sdp_list_t()
+            node.data = ctypes.c_void_p(val)
+            node.next = ctypes.POINTER(redmid._sdp_list_t)()
+            ptr = ctypes.pointer(node)
+            if prev is None:
+                head = ptr
+            else:
+                prev.contents.next = ptr
+            prev = ptr
+            nodes.append(node)
+        self._keepalive.extend(nodes)
+        addr = ctypes.cast(head, ctypes.c_void_p).value or 0
+        lid = self._next_list_id
+        self._next_list_id += 1
+        self._ptr_to_list_id[addr] = lid
+        self.active_lists.add(lid)
+        return head
+
+    def _sdp_connect(self, _src, _dst, _flags):
+        return 0x5E5510
+
+    def _sdp_close(self, session):
+        self.closed_sessions.append(int(session))
+
+    def _sdp_uuid128_create(self, _u, _raw):
+        return None
+
+    def _sdp_uuid16_create(self, _u, _val):
+        return None
+
+    def _sdp_list_append(self, existing, data_ptr):
+        assert not existing
+        raw_addr = ctypes.cast(data_ptr, ctypes.c_void_p).value or 0
+        return self._alloc_chain([raw_addr])
+
+    def _sdp_list_free(self, lst, _free_fn):
+        if not lst:
+            return
+        addr = ctypes.cast(lst, ctypes.c_void_p).value or 0
+        lid = self._ptr_to_list_id.get(addr)
+        assert lid is not None, f"Unknown or unallocated sdp_list_t freed: {addr:#x}"
+        assert lid in self.active_lists, f"Double free of sdp_list_t id={lid}"
+        self.active_lists.remove(lid)
+        self.freed_lists.append(lid)
+
+    def _sdp_service_search_attr_req(self, _sess, _search, _reqtype, attrid_list, rsp_out):
+        val_ptr = ctypes.cast(attrid_list.contents.data, ctypes.POINTER(ctypes.c_uint32))
+        self.requested_attr_ranges.append(int(val_ptr.contents.value))
+        rec_handles = []
+        for idx, _port in enumerate(self._records_ports, start=1):
+            handle = 0x1000 + idx
+            self.active_records.add(handle)
+            rec_handles.append(handle)
+        if rec_handles:
+            chain = self._alloc_chain(rec_handles)
+            ctypes.memmove(ctypes.addressof(rsp_out._obj), ctypes.addressof(chain), ctypes.sizeof(chain))  # type: ignore[attr-defined]
+        return self._search_err
+
+    def _sdp_get_access_protos(self, rec_handle, proto_out):
+        rec_id = int(rec_handle)
+        self.access_proto_queries.append(rec_id)
+        idx = rec_id - 0x1001
+        port = self._records_ports[idx]
+        # Allocate two inner protocol descriptor sub-lists (e.g., L2CAP + RFCOMM)
+        inner_l2cap = self._alloc_chain([0x0100])
+        inner_rfcomm = self._alloc_chain([0x0003, port])
+        outer = self._alloc_chain(
+            [
+                ctypes.cast(inner_l2cap, ctypes.c_void_p).value or 0,
+                ctypes.cast(inner_rfcomm, ctypes.c_void_p).value or 0,
+            ]
+        )
+        self._port_by_list_addr = getattr(self, "_port_by_list_addr", {})
+        self._port_by_list_addr[ctypes.cast(outer, ctypes.c_void_p).value or 0] = port
+        ctypes.memmove(ctypes.addressof(proto_out._obj), ctypes.addressof(outer), ctypes.sizeof(outer))  # type: ignore[attr-defined]
+        return 0
+
+    def _sdp_get_proto_port(self, proto_list, proto_uuid):
+        assert proto_uuid == redmid.RFCOMM_UUID
+        if self._raise_on_port:
+            raise RuntimeError("simulated ctypes failure")
+        addr = ctypes.cast(proto_list, ctypes.c_void_p).value or 0
+        return self._port_by_list_addr[addr]
+
+    def _sdp_record_free(self, rec_handle):
+        rec_id = int(rec_handle)
+        assert rec_id in self.active_records, f"Double or invalid free of sdp_record_t {rec_id:#x}"
+        self.active_records.remove(rec_id)
+        self.freed_records.append(rec_id)
+
+
+class TestSdpRecordCleanup(unittest.TestCase):
+    def test_frees_all_trailing_sdp_records_after_first_usable_channel(self) -> None:
+        # First record already has RFCOMM channel 6; peer also returns 3 trailing records
+        fake_bt = _FakeLibBluetooth(records_ports=[6, 9, 12, 0])
+        ch = redmid.sdp_find_rfcomm_channel("A0:90:B5:F8:E2:A7", protocol.UUID_MIUI_SPP, libbt=fake_bt)
+        self.assertEqual(ch, 6)
+        # Every single returned record (0x1001..0x1004) MUST be freed
+        self.assertEqual(fake_bt.freed_records, [0x1001, 0x1002, 0x1003, 0x1004])
+        self.assertEqual(len(fake_bt.active_records), 0)
+        # Trailing records should not even have access_protos allocated once channel is found
+        self.assertEqual(fake_bt.access_proto_queries, [0x1001])
+        # Every sdp_list_t (search_list, attrid_list, seq_list, outer + 2 inner proto_lists) MUST be freed
+        self.assertEqual(len(fake_bt.active_lists), 0)
+        self.assertEqual(fake_bt.closed_sessions, [0x5E5510])
+        # Only attribute 0x0004 (ProtocolDescriptorList) is requested
+        self.assertEqual(fake_bt.requested_attr_ranges, [0x00040004])
+
+    def test_frees_all_sdp_records_on_exception_or_search_error(self) -> None:
+        fake_exc = _FakeLibBluetooth(records_ports=[6, 8, 10], raise_on_port=True)
+        ch = redmid.sdp_find_rfcomm_channel("A0:90:B5:F8:E2:A7", protocol.UUID_MIUI_SPP, libbt=fake_exc)
+        self.assertIsNone(ch)
+        self.assertEqual(fake_exc.freed_records, [0x1001, 0x1002, 0x1003])
+        self.assertEqual(len(fake_exc.active_records), 0)
+        self.assertEqual(len(fake_exc.active_lists), 0)
+        self.assertEqual(fake_exc.closed_sessions, [0x5E5510])
+
+        fake_err = _FakeLibBluetooth(records_ports=[6, 8], search_err=-1)
+        ch_err = redmid.sdp_find_rfcomm_channel("A0:90:B5:F8:E2:A7", protocol.UUID_MIUI_SPP, libbt=fake_err)
+        self.assertIsNone(ch_err)
+        self.assertEqual(fake_err.freed_records, [0x1001, 0x1002])
+        self.assertEqual(len(fake_err.active_records), 0)
+        self.assertEqual(len(fake_err.active_lists), 0)
+        self.assertEqual(fake_err.closed_sessions, [0x5E5510])
 
 
 if __name__ == "__main__":

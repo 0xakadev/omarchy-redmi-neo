@@ -17,7 +17,7 @@ import sys
 sys.dont_write_bytecode = True
 
 # Ensure system Python with Bluetooth & D-Bus bindings is used even if invoked via mise/pyenv python3
-if not hasattr(socket, "AF_BLUETOOTH") and os.path.exists("/usr/bin/python3"):
+if __name__ == "__main__" and not hasattr(socket, "AF_BLUETOOTH") and os.path.exists("/usr/bin/python3"):
     os.execv("/usr/bin/python3", ["/usr/bin/python3"] + sys.argv)
 
 import ctypes
@@ -151,14 +151,43 @@ _sdp_list_t._fields_ = [
 
 RFCOMM_UUID = 0x0003
 SDP_ATTR_REQ_RANGE = 0x0002
+SDP_ATTR_PROTO_DESC_LIST = 0x0004
 
 
-def sdp_find_rfcomm_channel(mac: str, uuid_str: str) -> int | None:
+def _free_sdp_proto_list(libbt: Any, proto_list: Any) -> None:
+    """Frees both inner protocol descriptor sub-lists and the outer access-proto list."""
+    if not proto_list:
+        return
+    curr = proto_list
+    while curr:
+        inner = curr.contents.data
+        if inner:
+            libbt.sdp_list_free(ctypes.cast(inner, ctypes.POINTER(_sdp_list_t)), None)
+        curr = curr.contents.next
+    libbt.sdp_list_free(proto_list, None)
+
+
+def _free_sdp_record_list(libbt: Any, seq_list: Any) -> None:
+    """Frees every remaining allocated `sdp_record_t` in `seq_list` and then frees `seq_list`."""
+    if not seq_list:
+        return
+    curr = seq_list
+    while curr:
+        rec = curr.contents.data
+        if rec:
+            libbt.sdp_record_free(rec)
+            curr.contents.data = None
+        curr = curr.contents.next
+    libbt.sdp_list_free(seq_list, None)
+
+
+def sdp_find_rfcomm_channel(mac: str, uuid_str: str, libbt: Any = None) -> int | None:
     """Queries the remote Bluetooth device SDP server for the RFCOMM channel of `uuid_str`."""
-    try:
-        libbt = ctypes.CDLL("libbluetooth.so.3")
-    except OSError:
-        return None
+    if libbt is None:
+        try:
+            libbt = ctypes.CDLL("libbluetooth.so.3")
+        except OSError:
+            return None
 
     try:
         libbt.sdp_connect.argtypes = [ctypes.POINTER(_bdaddr_t), ctypes.POINTER(_bdaddr_t), ctypes.c_uint32]
@@ -199,38 +228,49 @@ def sdp_find_rfcomm_channel(mac: str, uuid_str: str) -> int | None:
             libbt.sdp_uuid128_create(ctypes.byref(u), raw_uuid)
 
             search_list = libbt.sdp_list_append(None, ctypes.byref(u))
-            attr_range = ctypes.c_uint32(0x0000FFFF)
+            attr_range = ctypes.c_uint32((SDP_ATTR_PROTO_DESC_LIST << 16) | SDP_ATTR_PROTO_DESC_LIST)
             attrid_list = libbt.sdp_list_append(None, ctypes.byref(attr_range))
             seq_list = ctypes.POINTER(_sdp_list_t)()
+            try:
+                err = libbt.sdp_service_search_attr_req(
+                    session,
+                    search_list,
+                    SDP_ATTR_REQ_RANGE,
+                    attrid_list,
+                    ctypes.byref(seq_list),
+                )
+            finally:
+                if search_list:
+                    libbt.sdp_list_free(search_list, None)
+                if attrid_list:
+                    libbt.sdp_list_free(attrid_list, None)
 
-            err = libbt.sdp_service_search_attr_req(
-                session,
-                search_list,
-                SDP_ATTR_REQ_RANGE,
-                attrid_list,
-                ctypes.byref(seq_list),
-            )
-            libbt.sdp_list_free(search_list, None)
-            libbt.sdp_list_free(attrid_list, None)
             if err != 0 or not seq_list:
+                _free_sdp_record_list(libbt, seq_list)
                 return None
 
             channel: int | None = None
-            curr = seq_list
-            while curr:
-                rec = curr.contents.data
-                if rec:
-                    proto_list = ctypes.POINTER(_sdp_list_t)()
-                    if libbt.sdp_get_access_protos(rec, ctypes.byref(proto_list)) == 0 and proto_list:
-                        port = libbt.sdp_get_proto_port(proto_list, RFCOMM_UUID)
-                        if port > 0:
-                            channel = int(port)
-                        libbt.sdp_list_free(proto_list, None)
-                    libbt.sdp_record_free(rec)
-                if channel is not None:
-                    break
-                curr = curr.contents.next
-            libbt.sdp_list_free(seq_list, None)
+            try:
+                curr = seq_list
+                while curr:
+                    rec = curr.contents.data
+                    if rec:
+                        try:
+                            if channel is None:
+                                proto_list = ctypes.POINTER(_sdp_list_t)()
+                                try:
+                                    if libbt.sdp_get_access_protos(rec, ctypes.byref(proto_list)) == 0 and proto_list:
+                                        port = libbt.sdp_get_proto_port(proto_list, RFCOMM_UUID)
+                                        if 0 < port <= 30:
+                                            channel = int(port)
+                                finally:
+                                    _free_sdp_proto_list(libbt, proto_list)
+                        finally:
+                            libbt.sdp_record_free(rec)
+                            curr.contents.data = None
+                    curr = curr.contents.next
+            finally:
+                _free_sdp_record_list(libbt, seq_list)
             return channel
         finally:
             libbt.sdp_close(session)

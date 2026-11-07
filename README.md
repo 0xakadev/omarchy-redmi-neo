@@ -2,6 +2,14 @@
 
 Full-featured Omarchy bar widget and control panel specifically built for **REDMI Headphones Neo** (`miwear.headphone.o70cg` / `M2546E1`, `VID 0x2717`, `PID 0x50F0`).
 
+![REDMI Headphones Neo Panel](preview.png)
+
+## Installation
+
+```bash
+omarchy plugin add https://github.com/0xakadev/omarchy-redmi-neo.git --enable
+```
+
 ## Supported Hardware Features
 
 - **Active Noise Cancellation (ANC)**:
@@ -33,7 +41,7 @@ Use `bin/redmictl` or Omarchy IPC:
 ~/.config/omarchy/plugins/0xakadev.redmi-neo/bin/redmictl state
 
 # Cycle ANC modes (Off -> ANC -> Transparency)
-omarchy-shell ipc call 0xakadev.redmi-neo.anc set cycle
+omarchy-shell 0xakadev.redmi-neo.anc set cycle
 ~/.config/omarchy/plugins/0xakadev.redmi-neo/bin/redmictl anc cycle
 
 # Set ANC strength or EQ preset
