@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "0xakadev.redmi-neo",
   "name": "REDMI Headphones Neo",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Manage REDMI Headphones Neo (M2546E1 / o70cg) — ANC, Transparency, Adaptive ANC, Battery, 10-Band EQ, Dual-Device Connection, Game Mode, MFB Gestures, and Find My Headphones",
   "author": "0xakadev",
   "license": "MIT",
