@@ -586,6 +586,7 @@ class RedmiNeoDaemon:
         self._pending_trans_due = 0.0
         # MAC -> RFCOMM channels resolved via SDP (avoids 3 SDP round-trips per reconnect).
         self._channel_cache: dict[str, list[int]] = {}
+        self._last_adaptive_check = 0.0
         self._last_saved_cfg: str | None = None
         self._stop_event = threading.Event()
 
@@ -963,11 +964,12 @@ class RedmiNeoDaemon:
                 break
             time.sleep(gap)
 
-    # Live mode/level is polled fast; slower-moving settings (battery, EQ, toggles, MFB)
-    # are refreshed on every Nth poll so changes from the phone app or the headset's own
-    # buttons still show up in the panel within a few seconds.
+    # Live mode/level/adaptive state is polled fast; slower-moving settings (battery, EQ,
+    # toggles, MFB) are refreshed on every Nth poll so changes from the phone app or the
+    # headset's own buttons still show up in the panel in real time.
     def _query_live_status(self, full: bool = False) -> None:
         reqs: list[tuple[Any, ...]] = [
+            (protocol.build_get_config, protocol.CFG_ADAPTIVE_ANC),
             (protocol.build_get_config, protocol.CFG_EFFECT_STRENGTH),
             (protocol.build_get_config, protocol.CFG_TRANS_MODE),
         ]
@@ -987,7 +989,6 @@ class RedmiNeoDaemon:
         """Sends initial RCSP queries after connecting/authenticating."""
         # NOTE: DEV_INFO_BIT_ANC is deliberately not queried: on this headset it is a
         # constant capability flag, not the live mode (see protocol.parse_device_info_tlvs).
-        # CFG_ADAPTIVE_ANC is queried before CFG_EFFECT_STRENGTH so the active 0x0B state wins.
         self._send_reads(
             [
                 (protocol.build_get_device_info_mask, protocol.DEV_INFO_BIT_BATTERY),
@@ -1045,6 +1046,17 @@ class RedmiNeoDaemon:
                 return False
             return sent_ts < self._last_write_ts
 
+    def _maybe_query_adaptive_anc(self) -> None:
+        """Rate-limited check of CFG_ADAPTIVE_ANC (0x25) after an unsolicited ANC level push."""
+        now = time.monotonic()
+        with self._lock:
+            if not self._rfcomm_authenticated or not self.state.get("adaptive_anc"):
+                return
+            if (now - self._last_adaptive_check) < 0.5:
+                return
+            self._last_adaptive_check = now
+        self._send_read(protocol.build_get_config, protocol.CFG_ADAPTIVE_ANC)
+
     def _handle_rcsp_packet(self, pkt: protocol.RcspPacket, auth: protocol.CommandAuthSession) -> None:
         # 1. Handle SAFER+ mutual authentication packets (0x50 / 0x51)
         if pkt.opcode in (protocol.OP_AUTH_CHALLENGE, protocol.OP_AUTH_CONFIRM):
@@ -1077,17 +1089,23 @@ class RedmiNeoDaemon:
 
         elif pkt.opcode == protocol.OP_REPORT_STATUS and pkt.is_request_or_notify:
             info = protocol.parse_report_status_tlvs(pkt.payload)
-            if (time.monotonic() - self._last_write_ts) < self.DSP_SETTLE_SEC:
+            settled = (time.monotonic() - self._last_write_ts) >= self.DSP_SETTLE_SEC
+            if not settled:
                 for k in ("anc", "anc_level", "trans_level", "adaptive_anc"):
                     info.pop(k, None)
             self._apply_parsed_updates(info, from_rcsp=True)
+            if settled and "anc_level" in info:
+                self._maybe_query_adaptive_anc()
 
         elif pkt.opcode in (protocol.OP_GET_CONFIG, protocol.OP_NOTIFY_CONFIG):
             info = protocol.parse_config_records(pkt.payload)
-            if pkt.is_request_or_notify and (time.monotonic() - self._last_write_ts) < self.DSP_SETTLE_SEC:
+            settled = (time.monotonic() - self._last_write_ts) >= self.DSP_SETTLE_SEC
+            if pkt.is_request_or_notify and not settled:
                 for k in ("anc", "anc_level", "trans_level", "adaptive_anc"):
                     info.pop(k, None)
             self._apply_parsed_updates(info, from_rcsp=True)
+            if pkt.is_request_or_notify and settled and "anc_level" in info and "adaptive_anc" not in info:
+                self._maybe_query_adaptive_anc()
 
     def _run_rcsp_session(self, sock: socket.socket, is_fastpair: bool = False) -> None:
         parser = protocol.RcspStreamParser()
@@ -1105,6 +1123,7 @@ class RedmiNeoDaemon:
         start_ts = time.monotonic()
         last_live_poll = start_ts
         poll_tick = 0
+        got_valid_packet = False
 
         try:
             while not self._stop_event.is_set():
@@ -1121,6 +1140,7 @@ class RedmiNeoDaemon:
                             self._apply_parsed_updates(fp_updates, from_rcsp=False)
                     else:
                         for pkt in parser.feed(chunk):
+                            got_valid_packet = True
                             self._handle_rcsp_packet(pkt, auth)
                 except socket.timeout:
                     pass
@@ -1139,14 +1159,17 @@ class RedmiNeoDaemon:
                     self._touch_write_ts()
                     now = time.monotonic()
 
+                if not is_fastpair and not self._rfcomm_authenticated and not got_valid_packet and (now - start_ts >= 4.0):
+                    # Connected to a non-RCSP RFCOMM channel (e.g. vendor channel) or stale peer; drop and retry.
+                    break
                 if not self._rfcomm_authenticated and not queried_fallback and (now - start_ts >= 1.0):
                     queried_fallback = True
                     self._query_initial_device_state()
                 elif self._rfcomm_authenticated:
-                    if (now - last_live_poll >= 2.0) and (now - self._last_write_ts >= self.POLL_QUIET_AFTER_WRITE_SEC):
+                    if (now - last_live_poll >= 1.5) and (now - self._last_write_ts >= self.POLL_QUIET_AFTER_WRITE_SEC):
                         last_live_poll = now
                         poll_tick += 1
-                        self._query_live_status(full=(poll_tick % 3 == 0))
+                        self._query_live_status(full=(poll_tick % 4 == 0))
                 elif is_fastpair:
                     sock.settimeout(4.0)
         finally:
@@ -1246,6 +1269,8 @@ class RedmiNeoDaemon:
                         self._send_raw(protocol.build_set_anc_mode(self._mark_write_seq(), mode))
                         if mode == "anc":
                             time.sleep(0.05)
+                            self._send_raw(protocol.build_set_adaptive_anc(self._mark_write_seq(), adaptive))
+                            time.sleep(0.03)
                             eff_lvl = (
                                 "adaptive"
                                 if adaptive
@@ -1271,7 +1296,6 @@ class RedmiNeoDaemon:
                         self._begin_write()
                         self._pending_trans_apply = None
                         need_anc_mode = self.state.get("anc") != "anc"
-                        was_adaptive = bool(self.state.get("adaptive_anc"))
                         want_adaptive = level == "adaptive"
                         self.state["anc"] = "anc"
                         if not want_adaptive:
@@ -1282,9 +1306,8 @@ class RedmiNeoDaemon:
                         if need_anc_mode:
                             self._send_raw(protocol.build_set_anc_mode(self._mark_write_seq(), "anc"))
                             time.sleep(0.05)
-                        if was_adaptive != want_adaptive:
-                            self._send_raw(protocol.build_set_adaptive_anc(self._mark_write_seq(), want_adaptive))
-                            time.sleep(0.03)
+                        self._send_raw(protocol.build_set_adaptive_anc(self._mark_write_seq(), want_adaptive))
+                        time.sleep(0.03)
                         self._send_raw(protocol.build_set_anc_level(self._mark_write_seq(), level))
                         self._touch_write_ts()
                     self._persist_state()

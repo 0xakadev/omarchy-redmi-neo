@@ -745,7 +745,8 @@ def parse_report_status_tlvs(payload: bytes) -> dict[str, Any]:
                 if val[1] == 0x03:
                     info["adaptive_anc"] = True
                 elif val[1] in BYTE_TO_ANC_LEVEL:
-                    info["adaptive_anc"] = False
+                    # Do not clear adaptive_anc here: while CFG_ADAPTIVE_ANC (0x25) is enabled,
+                    # the headset reports the currently adapted ANC strength (0x00/0x01/0x02).
                     info["anc_level"] = BYTE_TO_ANC_LEVEL[val[1]]
     return info
 
@@ -812,7 +813,10 @@ def parse_config_records(payload: bytes) -> dict[str, Any]:
                 if strength == 0x03:
                     updates["adaptive_anc"] = True
                 elif strength in BYTE_TO_ANC_LEVEL:
-                    updates["adaptive_anc"] = False
+                    # Hardware-verified on REDMI Headphones Neo (fw 3.0.2.9): while Adaptive ANC
+                    # (CFG_ADAPTIVE_ANC 0x25 == 0x01) is active, 0x0B reports the live adapted
+                    # strength (0x00/0x01/0x02). Only CFG_ADAPTIVE_ANC (0x25) authoritatively turns
+                    # adaptive_anc off.
                     updates["anc_level"] = BYTE_TO_ANC_LEVEL[strength]
 
         elif cfg_id == CFG_TRANS_MODE and len(val) >= 1:

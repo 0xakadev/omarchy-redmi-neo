@@ -225,7 +225,7 @@ class TestRcspProtocolAndCommands(unittest.TestCase):
         cfg = protocol.parse_config_records(pkt.payload)
         self.assertEqual(cfg["anc"], "anc")
         self.assertEqual(cfg["anc_level"], "deep")
-        self.assertFalse(cfg["adaptive_anc"])
+        self.assertNotIn("adaptive_anc", cfg)
 
         # Bitmask query for battery (bit 7 = 0x80) and ANC (bit 4 = 0x10)
         mask_batt = protocol.parse_frame(protocol.build_get_device_info_mask(3, protocol.DEV_INFO_BIT_BATTERY))
@@ -585,6 +585,97 @@ class TestDaemonStateSyncAndPipewireCodec(unittest.TestCase):
             daemon._handle_rcsp_packet(ntf_pkt, auth)
             self.assertEqual(daemon.state["anc"], "off")
             self.assertEqual(daemon.state["battery"], 77)
+
+    def test_adaptive_anc_persists_across_live_strength_updates(self) -> None:
+        from unittest import mock
+
+        with mock.patch.object(redmid, "load_config", return_value={}), mock.patch.object(
+            redmid, "save_config", return_value=None
+        ):
+            daemon = redmid.RedmiNeoDaemon()
+            auth = protocol.CommandAuthSession(daemon._next_seq)
+            daemon._rfcomm_authenticated = True
+            sent_frames: list[bytes] = []
+            daemon._send_raw = lambda data: sent_frames.append(data) or True  # type: ignore[method-assign]
+
+            # 1. Headset reports CFG_ADAPTIVE_ANC (0x25) = 0x01
+            adap_on_pkt = protocol.parse_frame(
+                protocol.build_response(protocol.OP_GET_CONFIG, daemon._next_seq(), bytes.fromhex("03002501"))
+            )
+            assert adap_on_pkt is not None
+            daemon._handle_rcsp_packet(adap_on_pkt, auth)
+            self.assertTrue(daemon.state["adaptive_anc"])
+
+            # 2. Headset adapts in real time and reports CFG_EFFECT_STRENGTH (0x0B) = 0x01 (light)
+            #    via poll response (0xF3) AND push notify (0xF4); adaptive_anc must stay True while anc_level updates
+            daemon._last_write_ts = redmid.time.monotonic() - 3.0
+            eff_light_pkt = protocol.parse_frame(
+                protocol.build_response(protocol.OP_GET_CONFIG, daemon._next_seq(), bytes.fromhex("04000b0101"))
+            )
+            assert eff_light_pkt is not None
+            daemon._handle_rcsp_packet(eff_light_pkt, auth)
+            self.assertTrue(daemon.state["adaptive_anc"])
+            self.assertEqual(daemon.state["anc"], "anc")
+            self.assertEqual(daemon.state["anc_level"], "light")
+
+            # Unsolicited 0xF4 notify changing adapted level to deep also triggers a 0x25 verification read
+            ntf_deep = protocol.parse_frame(
+                protocol.build_request(protocol.OP_NOTIFY_CONFIG, 42, bytes.fromhex("04000b0102"), flags=0x80)
+            )
+            assert ntf_deep is not None
+            daemon._handle_rcsp_packet(ntf_deep, auth)
+            self.assertTrue(daemon.state["adaptive_anc"])
+            self.assertEqual(daemon.state["anc_level"], "deep")
+            self.assertTrue(
+                any(
+                    (p := protocol.parse_frame(f)) is not None
+                    and p.opcode == protocol.OP_GET_CONFIG
+                    and p.payload == b"\x00\x25"
+                    for f in sent_frames
+                )
+            )
+
+            # 3. OP_REPORT_STATUS (0x0E) with TLV 0x04 = 0x01 0x00 (balanced) does not clear adaptive_anc
+            ntf_status = protocol.parse_frame(
+                protocol.build_request(protocol.OP_REPORT_STATUS, 43, bytes.fromhex("03040100"), flags=0x80)
+            )
+            assert ntf_status is not None
+            daemon._handle_rcsp_packet(ntf_status, auth)
+            self.assertTrue(daemon.state["adaptive_anc"])
+            self.assertEqual(daemon.state["anc_level"], "balanced")
+
+            # 4. Headset reports CFG_ADAPTIVE_ANC (0x25) = 0x00 -> adaptive_anc turns False in real time
+            adap_off_pkt = protocol.parse_frame(
+                protocol.build_response(protocol.OP_GET_CONFIG, daemon._next_seq(), bytes.fromhex("03002500"))
+            )
+            assert adap_off_pkt is not None
+            daemon._handle_rcsp_packet(adap_off_pkt, auth)
+            self.assertFalse(daemon.state["adaptive_anc"])
+
+            # 5. _query_live_status includes CFG_ADAPTIVE_ANC (0x25)
+            sent_frames.clear()
+            daemon._query_live_status(full=False)
+            op_cfg_ids = [
+                p.payload
+                for f in sent_frames
+                if (p := protocol.parse_frame(f)) is not None and p.opcode == protocol.OP_GET_CONFIG
+            ]
+            self.assertIn(b"\x00\x25", op_cfg_ids)
+            self.assertIn(b"\x00\x0b", op_cfg_ids)
+
+            # 6. Manual anc-level write always sends CFG_ADAPTIVE_ANC=0 even if cached adaptive_anc was False
+            sent_frames.clear()
+            daemon._rfcomm_sock = mock.Mock()
+            daemon.state["connected"] = True
+            daemon.state["adaptive_anc"] = False
+            daemon.handle_command({"cmd": "anc-level", "level": "deep"})
+            set_payloads = [
+                p.payload
+                for f in sent_frames
+                if (p := protocol.parse_frame(f)) is not None and p.opcode == protocol.OP_SET_CONFIG
+            ]
+            self.assertIn(b"\x03\x00\x25\x00", set_payloads)
+            self.assertIn(b"\x04\x00\x0b\x01\x02", set_payloads)
 
 
 if __name__ == "__main__":

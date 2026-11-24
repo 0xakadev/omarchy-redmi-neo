@@ -307,7 +307,7 @@ Panel {
   }
 
   Timer {
-    interval: panel.opened ? 1000 : 2000
+    interval: panel.opened ? 750 : 2000
     running: true
     repeat: true
     triggeredOnStart: true
