@@ -678,5 +678,227 @@ class TestDaemonStateSyncAndPipewireCodec(unittest.TestCase):
             self.assertIn(b"\x04\x00\x0b\x01\x02", set_payloads)
 
 
+class TestUsbCableMode(unittest.TestCase):
+    def test_sysfs_usb_detection_and_alsa_stream0_parsing(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            # Interface dir (with ':') must be ignored even if it had vendor/product files
+            iface_dir = root / "1-5:1.0"
+            iface_dir.mkdir()
+            (iface_dir / "idVendor").write_text("2717\n", encoding="utf-8")
+            (iface_dir / "idProduct").write_text("50f0\n", encoding="utf-8")
+
+            # Other unrelated USB device
+            other = root / "1-1"
+            other.mkdir()
+            (other / "idVendor").write_text("062a\n", encoding="utf-8")
+            (other / "idProduct").write_text("5918\n", encoding="utf-8")
+
+            # Actual REDMI Headphones Neo USB device
+            dev = root / "1-5"
+            dev.mkdir()
+            (dev / "idVendor").write_text("2717\n", encoding="utf-8")
+            (dev / "idProduct").write_text("50f0\n", encoding="utf-8")
+            (dev / "authorized").write_text("1\n", encoding="utf-8")
+            (dev / "product").write_text("REDMI Headphones Neo\n", encoding="utf-8")
+            (dev / "manufacturer").write_text("Generic\n", encoding="utf-8")
+            (dev / "serial").write_text("73670/CEAGDF6QT0\n", encoding="utf-8")
+            (dev / "bcdDevice").write_text("2681\n", encoding="utf-8")
+            (dev / "bMaxPower").write_text("300mA\n", encoding="utf-8")
+
+            found = redmid.query_usb_redmi_neo(sysfs_usb_root=root)
+            self.assertIsNotNone(found)
+            assert found is not None
+            self.assertEqual(found["vid"], "2717")
+            self.assertEqual(found["pid"], "50f0")
+            self.assertEqual(found["product"], "REDMI Headphones Neo")
+            self.assertEqual(found["serial"], "73670/CEAGDF6QT0")
+            self.assertEqual(found["max_power"], "300mA")
+
+            # Unauthorized USB device must be ignored
+            (dev / "authorized").write_text("0\n", encoding="utf-8")
+            self.assertIsNone(redmid.query_usb_redmi_neo(sysfs_usb_root=root))
+
+        stream0 = (
+            "Generic REDMI Headphones Neo at usb-0000:00:14.0-5, full speed : USB Audio\n\n"
+            "Playback:\n"
+            "  Status: Running\n"
+            "    Interface = 1\n"
+            "    Altset = 1\n"
+            "    Packet Size = 432\n"
+            "    Momentary freq = 48000 Hz (0x30.0000)\n"
+            "  Interface 1\n"
+            "    Altset 1\n"
+            "    Format: S24_3LE\n"
+            "    Channels: 2\n"
+            "    Rates: 44100, 48000, 96000\n"
+            "    Bits: 24\n"
+            "  Interface 1\n"
+            "    Altset 2\n"
+            "    Format: S16_LE\n"
+            "    Channels: 2\n"
+            "    Rates: 44100, 48000, 96000\n"
+            "    Bits: 16\n"
+        )
+        parsed = redmid._parse_alsa_stream0(stream0)
+        self.assertEqual(parsed["status"], "Running")
+        self.assertEqual(parsed["codec"], "PCM 24-bit/48kHz")
+
+        pactl_sinks = (
+            "Sink #56\n"
+            "\tName: alsa_output.usb-Generic_REDMI_Headphones_Neo_73670_CEAGDF6QT0-00.analog-stereo\n"
+            "\tSample Specification: s24le 2ch 48000Hz\n"
+            "\tMute: no\n"
+            "\tVolume: front-left: 29488 /  45% / -20.81 dB,   front-right: 29488 /  45% / -20.81 dB\n"
+            "\tProperties:\n"
+            '\t\tdevice.vendor.id = "0x2717"\n'
+            '\t\tdevice.product.id = "0x50f0"\n'
+        )
+        pactl_cards = (
+            "Card #57\n"
+            "\tName: alsa_card.usb-Generic_REDMI_Headphones_Neo_73670_CEAGDF6QT0-00\n"
+            "\tProperties:\n"
+            '\t\tdevice.vendor.id = "0x2717"\n'
+            '\t\tdevice.product.id = "0x50f0"\n'
+            "\tActive Profile: output:analog-stereo+input:analog-stereo\n"
+        )
+        pw = redmid._parse_pactl_usb_audio(
+            pactl_sinks,
+            pactl_cards,
+            "alsa_output.usb-Generic_REDMI_Headphones_Neo_73670_CEAGDF6QT0-00.analog-stereo",
+        )
+        self.assertEqual(
+            pw,
+            {
+                "codec": "PCM 24-bit/48kHz",
+                "profile": "USB-C Duplex",
+                "sink_name": "alsa_output.usb-Generic_REDMI_Headphones_Neo_73670_CEAGDF6QT0-00.analog-stereo",
+                "volume": 45,
+                "muted": False,
+                "is_default": True,
+            },
+        )
+
+    def test_daemon_usb_cable_state_charging_and_unplug(self) -> None:
+        from unittest import mock
+
+        usb_info = {
+            "vid": "2717",
+            "pid": "50f0",
+            "product": "REDMI Headphones Neo",
+            "manufacturer": "Generic",
+            "serial": "73670/CEAGDF6QT0",
+            "bcd_device": "2681",
+            "max_power": "300mA",
+            "sysfs_path": "/sys/bus/usb/devices/1-5",
+        }
+        bt_dev = {
+            "path": "/org/bluez/hci0/dev_A0_90_B5_F8_E2_A7",
+            "mac": "A0:90:B5:F8:E2:A7",
+            "name": "REDMI Headphones Neo",
+            "alias": "REDMI Headphones Neo",
+            "connected": False,
+            "paired": True,
+            "uuids": [],
+            "bluez_battery": None,
+            "beacon_battery": None,
+            "beacon_charging": False,
+            "vid": None,
+            "pid": None,
+            "is_redmi_neo": True,
+        }
+
+        saved_cfg: dict[str, object] = {}
+        with mock.patch.object(
+            redmid,
+            "load_config",
+            return_value={
+                "last_battery": 10,
+                "anc": "anc",
+                "anc_level": "deep",
+                "adaptive_anc": True,
+                "eq": "voice",
+            },
+        ), mock.patch.object(redmid, "save_config", side_effect=lambda d: saved_cfg.update(d)):
+            daemon = redmid.RedmiNeoDaemon()
+
+            with mock.patch.object(redmid, "query_usb_redmi_neo", return_value=usb_info), mock.patch.object(
+                redmid, "query_bluez_devices", return_value=[bt_dev]
+            ), mock.patch.object(
+                redmid,
+                "query_usb_audio_info",
+                return_value={
+                    "codec": "PCM 24-bit/48kHz",
+                    "profile": "USB-C Duplex",
+                    "sink_name": "alsa_output.usb-Generic_REDMI_Headphones_Neo_73670_CEAGDF6QT0-00.analog-stereo",
+                    "volume": 45,
+                    "muted": False,
+                    "is_default": True,
+                },
+            ):
+                daemon.refresh_bluez(force_codec=True)
+
+            snap = daemon._snapshot_state()
+            self.assertTrue(snap["connected"])
+            self.assertTrue(snap["usb_connected"])
+            self.assertFalse(snap["bluetooth_connected"])
+            self.assertEqual(snap["connection_type"], "usb")
+            self.assertTrue(snap["charging"])
+            self.assertTrue(snap["usb_charging"])
+            # Stale pre-cable battery must not be displayed as live over USB-C
+            self.assertIsNone(snap["battery"])
+            self.assertEqual(snap["battery_source"], "usb")
+            self.assertEqual(snap["codec"], "PCM 24-bit/48kHz")
+            self.assertEqual(snap["profile"], "USB-C Duplex")
+            self.assertEqual(snap["usb_volume"], 45)
+            self.assertTrue(snap["usb_default_audio"])
+            # Default mode on cable must be Off (ANC) and Balanced (EQ), and neither can be used
+            self.assertEqual(snap["anc"], "off")
+            self.assertFalse(snap["anc_available"])
+            self.assertFalse(snap["adaptive_anc"])
+            self.assertEqual(snap["eq"], "balanced")
+            self.assertFalse(snap["eq_available"])
+            # Persisted BT ANC / EQ / battery preferences must not be clobbered by USB-only mode
+            self.assertEqual(saved_cfg.get("anc"), "anc")
+            self.assertEqual(saved_cfg.get("anc_level"), "deep")
+            self.assertEqual(saved_cfg.get("eq"), "voice")
+            self.assertEqual(saved_cfg.get("last_battery"), 10)
+
+            # Hardware write without Bluetooth RCSP must keep ANC off and report a clear error
+            res = daemon.handle_command({"cmd": "anc", "mode": "anc"})
+            self.assertEqual(res["anc"], "off")
+            self.assertIn("USB-C cable", res["error"])
+
+            # Disconnect over USB-only must not invoke bluez_connect_device
+            with mock.patch.object(redmid, "query_usb_redmi_neo", return_value=usb_info), mock.patch.object(
+                redmid, "query_bluez_devices", return_value=[bt_dev]
+            ), mock.patch.object(redmid, "bluez_connect_device") as mock_bt_conn:
+                res_disc = daemon.handle_command({"cmd": "disconnect"})
+                mock_bt_conn.assert_not_called()
+                self.assertIn("USB-C", res_disc["error"])
+
+            # Unplugging cable clears connected, charging, and codec, and restores BT ANC/EQ/battery cache
+            with mock.patch.object(redmid, "query_usb_redmi_neo", return_value=None), mock.patch.object(
+                redmid, "query_bluez_devices", return_value=[bt_dev]
+            ):
+                daemon.refresh_bluez(force_codec=False)
+
+            snap_after = daemon._snapshot_state()
+            self.assertFalse(snap_after["connected"])
+            self.assertFalse(snap_after["usb_connected"])
+            self.assertEqual(snap_after["connection_type"], "none")
+            self.assertFalse(snap_after["charging"])
+            self.assertFalse(snap_after["usb_charging"])
+            self.assertIsNone(snap_after["codec"])
+            self.assertEqual(snap_after["battery"], 10)
+            self.assertEqual(snap_after["battery_source"], "cached")
+            self.assertTrue(snap_after["anc_available"])
+            self.assertEqual(snap_after["anc"], "anc")
+            self.assertTrue(snap_after["eq_available"])
+            self.assertEqual(snap_after["eq"], "voice")
+
+
 if __name__ == "__main__":
     unittest.main()

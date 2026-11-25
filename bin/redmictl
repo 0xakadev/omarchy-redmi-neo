@@ -116,8 +116,16 @@ def build_command_from_argv(argv: list[str]) -> dict[str, Any]:
         return {"cmd": "state"}
     cmd = argv[0].strip().lower()
 
-    if cmd in ("state", "poll", "scan", "eq-reset", "quit"):
+    if cmd in ("state", "poll", "scan", "eq-reset", "usb-set-default", "quit"):
         return {"cmd": cmd}
+
+    if cmd == "usb-volume" and len(argv) >= 2:
+        return {"cmd": "usb-volume", "volume": int(round(float(argv[1])))}
+
+    if cmd == "usb-mute":
+        if len(argv) >= 2:
+            return {"cmd": "usb-mute", "muted": _parse_bool(argv[1])}
+        return {"cmd": "usb-mute"}
 
     if cmd in ("connect", "disconnect"):
         req: dict[str, Any] = {"cmd": cmd}

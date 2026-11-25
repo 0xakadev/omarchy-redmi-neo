@@ -12,13 +12,23 @@ function neutralizeMarkup(value) {
     .replace(/>/g, "\uFF1E");
 }
 
-// Bar icon reflects connection state, Find-device alarm, and active ANC mode.
-function barIcon(connected, anc, finding) {
-  if (!connected) return "󰟎";               // nf-md-headphones_off
-  if (finding) return "󰂞";                  // nf-md-bell_ring
-  if (anc === "anc") return "󰥰";            // nf-md-headphones_bluetooth / ANC active
-  if (anc === "transparency") return "󰟅";   // nf-md-ear_hearing / ambient
-  return "󰋋";                               // nf-md-headphones
+// Bar icon reflects connection state, wired USB-C mode, Find-device alarm, and active ANC mode.
+function barIcon(connected, anc, finding, usbConnected, bluetoothConnected) {
+  if (!connected) return "󰟎";                              // nf-md-headphones_off
+  if (finding) return "󰂞";                                 // nf-md-bell_ring
+  if (usbConnected && !bluetoothConnected) return "󰋎";     // nf-md-headset (wired USB-C)
+  if (anc === "anc") return "󰥰";                           // nf-md-headphones_bluetooth / ANC active
+  if (anc === "transparency") return "󰟅";                  // nf-md-ear_hearing / ambient
+  return "󰋋";                                              // nf-md-headphones
+}
+
+function connectionStatusLabel(tr, connected, connecting, usbConnected, bluetoothConnected) {
+  var t = tr || function(k) { return k; };
+  if (connecting) return t("status.connecting");
+  if (!connected) return t("status.disconnected");
+  if (usbConnected && bluetoothConnected) return t("status.connected_usb_bt");
+  if (usbConnected) return t("status.connected_usb");
+  return t("status.connected");
 }
 
 function batteryGlyph(pct, charging) {

@@ -13,6 +13,9 @@ Panel {
 
   // ── State Properties ──
   property bool connected: false
+  property bool bluetoothConnected: false
+  property bool usbConnected: false
+  property string connectionType: "none"
   property bool rcspConnected: false
   property bool connecting: false
   property string deviceName: "REDMI Headphones Neo"
@@ -27,15 +30,24 @@ Panel {
   property int batteryCase: -1
   property string codec: ""
   property string profile: ""
+  property string usbMaxPower: ""
+  property string usbSerial: ""
+  property string usbSinkName: ""
+  property int usbVolume: -1
+  property bool usbMuted: false
+  property bool usbDefaultAudio: false
+  readonly property bool wiredOnly: panel.usbConnected && !panel.bluetoothConnected
 
   // Noise Control
   property string anc: "off"
+  property bool ancAvailable: true
   property string ancLevel: "balanced"
   property string transLevel: "regular"
   property bool adaptiveAnc: false
 
   // Equalizer
   property string eq: "balanced"
+  property bool eqAvailable: true
   property var eqBands: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
   property var eqFrequencies: [62, 125, 250, 500, 1000, 2000, 4000, 8000, 12000, 16000]
 
@@ -85,6 +97,9 @@ Panel {
     try {
       var s = JSON.parse(lastLine);
       if (s.connected !== undefined) panel.connected = Boolean(s.connected);
+      if (s.bluetooth_connected !== undefined) panel.bluetoothConnected = Boolean(s.bluetooth_connected);
+      if (s.usb_connected !== undefined) panel.usbConnected = Boolean(s.usb_connected);
+      if (s.connection_type) panel.connectionType = String(s.connection_type);
       if (s.rcsp_connected !== undefined) panel.rcspConnected = Boolean(s.rcsp_connected);
       if (s.connecting !== undefined) panel.connecting = Boolean(s.connecting);
       if (s.name) panel.deviceName = Model.neutralizeMarkup(s.name);
@@ -101,13 +116,21 @@ Panel {
 
       panel.codec = s.codec ? Model.neutralizeMarkup(s.codec) : "";
       panel.profile = s.profile ? Model.neutralizeMarkup(s.profile) : "";
+      panel.usbMaxPower = s.usb_max_power ? Model.neutralizeMarkup(s.usb_max_power) : "";
+      panel.usbSerial = s.usb_serial ? Model.neutralizeMarkup(s.usb_serial) : "";
+      panel.usbSinkName = s.usb_sink_name ? Model.neutralizeMarkup(s.usb_sink_name) : "";
+      panel.usbVolume = (s.usb_volume !== null && s.usb_volume !== undefined) ? Number(s.usb_volume) : -1;
+      panel.usbMuted = Boolean(s.usb_muted);
+      panel.usbDefaultAudio = Boolean(s.usb_default_audio);
 
       if (s.anc) panel.anc = String(s.anc);
+      if (s.anc_available !== undefined) panel.ancAvailable = Boolean(s.anc_available);
       if (s.anc_level) panel.ancLevel = String(s.anc_level);
       if (s.trans_level) panel.transLevel = String(s.trans_level);
       if (s.adaptive_anc !== undefined) panel.adaptiveAnc = Boolean(s.adaptive_anc);
 
       if (s.eq) panel.eq = String(s.eq);
+      if (s.eq_available !== undefined) panel.eqAvailable = Boolean(s.eq_available);
       if (Array.isArray(s.eq_bands) && s.eq_bands.length === 10) {
         panel.eqBands = s.eq_bands.map(function(v) { return Math.round(Number(v) || 0); });
       }
@@ -192,16 +215,24 @@ Panel {
   }
 
   function setAncMode(mode) {
+    if (!panel.ancAvailable || !panel.rcspConnected) {
+      if (panel.wiredOnly) {
+        panel.errorText = Model.neutralizeMarkup(panel.tr("anc.usb_unavailable"));
+      }
+      return;
+    }
     panel.anc = mode;
     runCtl(["anc", mode]);
   }
 
   function cycleAncMode() {
+    if (!panel.ancAvailable || !panel.rcspConnected) return;
     var next = Model.nextAnc(panel.anc);
     setAncMode(next);
   }
 
   function setAncLevel(level) {
+    if (!panel.ancAvailable || !panel.rcspConnected) return;
     panel.anc = "anc";
     panel.ancLevel = level;
     panel.adaptiveAnc = false;
@@ -209,12 +240,14 @@ Panel {
   }
 
   function setTransLevel(level) {
+    if (!panel.ancAvailable || !panel.rcspConnected) return;
     panel.anc = "transparency";
     panel.transLevel = level;
     runCtl(["trans-level", level]);
   }
 
   function setAdaptiveAnc(enabled) {
+    if (!panel.ancAvailable || !panel.rcspConnected) return;
     if (enabled && panel.anc !== "anc") {
       panel.anc = "anc";
     }
@@ -226,11 +259,13 @@ Panel {
   }
 
   function setEqPreset(preset) {
+    if (!panel.rcspConnected) return;
     panel.eq = preset;
     runCtl(["eq", preset]);
   }
 
   function setEqBand(index, gainDb) {
+    if (!panel.rcspConnected) return;
     var nextBands = panel.eqBands.slice();
     while (nextBands.length < 10) nextBands.push(0);
     nextBands[index] = Math.max(-6, Math.min(6, Math.round(gainDb)));
@@ -240,16 +275,41 @@ Panel {
   }
 
   function resetEqBands() {
+    if (!panel.rcspConnected) return;
     panel.eqBands = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
     runCtl(["eq-reset"]);
   }
 
+  function setUsbVolume(pct) {
+    if (!panel.usbConnected || panel.usbSinkName === "") return;
+    var clamped = Math.max(0, Math.min(100, Math.round(pct)));
+    panel.usbVolume = clamped;
+    runCtl(["usb-volume", String(clamped)]);
+  }
+
+  function toggleUsbMute() {
+    if (!panel.usbConnected || panel.usbSinkName === "") return;
+    panel.usbMuted = !panel.usbMuted;
+    runCtl(["usb-mute", panel.usbMuted ? "on" : "off"]);
+  }
+
+  function setUsbDefaultOutput() {
+    if (!panel.usbConnected || panel.usbSinkName === "") return;
+    panel.usbDefaultAudio = true;
+    runCtl(["usb-set-default"]);
+  }
+
   function toggleConnection() {
+    if (panel.wiredOnly) {
+      panel.refresh(true);
+      return;
+    }
     panel.connecting = true;
-    runCtl([panel.connected ? "disconnect" : "connect"]);
+    runCtl([panel.bluetoothConnected ? "disconnect" : "connect"]);
   }
 
   function cycleGestureAction(slot) {
+    if (!panel.rcspConnected) return;
     var opts = Model.gestureActionOptions(panel.tr, slot);
     var fallback = slot === "long" ? "anc_cycle" : "play_pause";
     var cur = (panel.gestures && panel.gestures[slot]) ? String(panel.gestures[slot]) : fallback;
@@ -333,16 +393,28 @@ Panel {
     anchors.fill: parent
     bar: panel.bar
     active: panel.opened || panel.connected
-    text: Model.barIcon(panel.connected, panel.anc, panel.finding)
+    text: Model.barIcon(panel.connected, panel.anc, panel.finding, panel.usbConnected, panel.bluetoothConnected)
+    labelText: (panel.charging && !barBtn.vertical) ? "󰂄" : ""
+    slotSize: Style.bar.iconSlot * (labelText !== "" ? 1.65 : 1)
     tooltipText: {
-      var status = panel.connected
-        ? (panel.tr("status.connected") + (panel.battery >= 0 ? (" · " + Model.formatBattery(panel.battery)) : ""))
-        : panel.tr("status.disconnected");
-      return Model.neutralizeMarkup(panel.deviceName + " — " + status);
+      var parts = [
+        Model.connectionStatusLabel(
+          panel.tr,
+          panel.connected,
+          panel.connecting,
+          panel.usbConnected,
+          panel.bluetoothConnected
+        )
+      ];
+      if (panel.charging) parts.push(panel.tr("battery.charging"));
+      if (panel.battery >= 0) parts.push(Model.formatBattery(panel.battery));
+      if (panel.connected && panel.codec !== "") parts.push(panel.codec);
+      return Model.neutralizeMarkup(panel.deviceName + " — " + parts.join(" · "));
     }
     onPressed: function(buttonCode) {
       if (buttonCode === Qt.RightButton || buttonCode === Qt.MiddleButton) {
-        if (panel.connected) panel.cycleAncMode();
+        if (panel.wiredOnly) panel.refresh(true);
+        else if (panel.bluetoothConnected && panel.ancAvailable) panel.cycleAncMode();
         else panel.toggleConnection();
       } else {
         panel.toggle();
@@ -409,7 +481,7 @@ Panel {
         Text {
           textFormat: Text.PlainText
           anchors.verticalCenter: parent.verticalCenter
-          text: Model.barIcon(panel.connected, panel.anc, panel.finding)
+          text: Model.barIcon(panel.connected, panel.anc, panel.finding, panel.usbConnected, panel.bluetoothConnected)
           color: panel.connected ? panel.accColor : panel.dimColor
           font.family: panel.fontFam
           font.pixelSize: Style.font.iconLarge
@@ -436,11 +508,15 @@ Panel {
             textFormat: Text.PlainText
             width: parent.width
             text: {
-              var parts = [];
-              if (panel.connecting) parts.push(panel.tr("status.connecting"));
-              else if (panel.connected) parts.push(panel.tr("status.connected"));
-              else parts.push(panel.tr("status.disconnected"));
-
+              var parts = [
+                Model.connectionStatusLabel(
+                  panel.tr,
+                  panel.connected,
+                  panel.connecting,
+                  panel.usbConnected,
+                  panel.bluetoothConnected
+                )
+              ];
               if (panel.connected && panel.codec !== "") parts.push(panel.codec);
               if (panel.saleModel !== "") parts.push(panel.saleModel);
               if (panel.firmware !== "") parts.push("v" + panel.firmware);
@@ -465,9 +541,15 @@ Panel {
           text: Model.neutralizeMarkup(
             panel.connecting
               ? panel.tr("status.connecting")
-              : (panel.connected ? panel.tr("action.disconnect") : panel.tr("action.connect"))
+              : (panel.wiredOnly
+                  ? panel.tr("status.usb_cable")
+                  : (panel.bluetoothConnected ? panel.tr("action.disconnect") : panel.tr("action.connect")))
           )
-          iconText: panel.connecting ? "󰑐" : (panel.connected ? "󰂲" : "󰂯")
+          iconText: panel.connecting
+            ? "󰑐"
+            : (panel.wiredOnly
+                ? "󰚥"
+                : (panel.bluetoothConnected ? "󰂲" : "󰂯"))
           iconSpinning: panel.connecting
           bordered: true
           selected: panel.connected
@@ -490,9 +572,170 @@ Panel {
       }
     }
 
+    // ── Cable Connection Card (shown when plugged in via USB-C) ──
+    Rectangle {
+      visible: panel.usbConnected
+      width: parent.width
+      height: cableCardCol.implicitHeight + Style.spacing.md * 2
+      radius: Style.cornerRadius
+      color: panel.subtleBg
+
+      Column {
+        id: cableCardCol
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.verticalCenter: parent.verticalCenter
+        anchors.leftMargin: Style.spacing.md
+        anchors.rightMargin: Style.spacing.md
+        spacing: Style.spacing.xs
+
+        Item {
+          width: parent.width
+          height: Math.max(cableTitleRow.implicitHeight, cableMetaText.implicitHeight)
+
+          Row {
+            id: cableTitleRow
+            anchors.left: parent.left
+            anchors.verticalCenter: parent.verticalCenter
+            spacing: Style.spacing.sm
+
+            Text {
+              textFormat: Text.PlainText
+              anchors.verticalCenter: parent.verticalCenter
+              text: "󰚥"
+              color: panel.accColor
+              font.family: panel.fontFam
+              font.pixelSize: Style.font.icon
+            }
+
+            Text {
+              textFormat: Text.PlainText
+              anchors.verticalCenter: parent.verticalCenter
+              text: Model.neutralizeMarkup(panel.tr("cable.title"))
+              color: panel.fgColor
+              font.family: panel.fontFam
+              font.pixelSize: Style.font.body
+              font.bold: true
+            }
+          }
+
+          Text {
+            id: cableMetaText
+            textFormat: Text.PlainText
+            anchors.right: parent.right
+            anchors.verticalCenter: parent.verticalCenter
+            text: Model.neutralizeMarkup(
+              [panel.profile || panel.tr("status.usb_short"), panel.usbMaxPower]
+                .filter(function(x) { return x !== ""; })
+                .join(" · ")
+            )
+            color: panel.dimColor
+            font.family: panel.fontFam
+            font.pixelSize: Style.font.caption
+          }
+        }
+
+        Item {
+          width: parent.width
+          height: Math.max(cableCodecText.implicitHeight, cableDefaultBtn.implicitHeight)
+
+          Text {
+            id: cableCodecText
+            textFormat: Text.PlainText
+            anchors.left: parent.left
+            anchors.right: cableDefaultBtn.left
+            anchors.rightMargin: Style.spacing.sm
+            anchors.verticalCenter: parent.verticalCenter
+            text: Model.neutralizeMarkup(panel.codec !== "" ? panel.codec : "USB Audio")
+            color: panel.dimColor
+            font.family: panel.fontFam
+            font.pixelSize: Style.font.caption
+            elide: Text.ElideRight
+          }
+
+          Button {
+            id: cableDefaultBtn
+            visible: panel.usbSinkName !== ""
+            anchors.right: parent.right
+            anchors.verticalCenter: parent.verticalCenter
+            bordered: true
+            selected: panel.usbDefaultAudio
+            text: Model.neutralizeMarkup(
+              panel.usbDefaultAudio ? panel.tr("cable.default_active") : panel.tr("cable.set_default")
+            )
+            foreground: panel.fgColor
+            accent: panel.accColor
+            fontFamily: panel.fontFam
+            fontSize: Style.font.caption
+            horizontalPadding: Style.spacing.sm
+            verticalPadding: Style.space(2)
+            onClicked: {
+              if (!panel.usbDefaultAudio) panel.setUsbDefaultOutput();
+            }
+          }
+        }
+
+        Item {
+          visible: panel.usbSinkName !== "" && panel.usbVolume >= 0
+          width: parent.width
+          height: Math.max(usbMuteBtn.implicitHeight, Style.space(22))
+
+          Button {
+            id: usbMuteBtn
+            anchors.left: parent.left
+            anchors.verticalCenter: parent.verticalCenter
+            iconText: panel.usbMuted ? "󰝟" : "󰕾"
+            selected: panel.usbMuted
+            bordered: true
+            foreground: panel.fgColor
+            accent: panel.accColor
+            fontFamily: panel.fontFam
+            fontSize: Style.font.caption
+            horizontalPadding: Style.spacing.xs
+            verticalPadding: Style.space(2)
+            onClicked: panel.toggleUsbMute()
+          }
+
+          PanelSlider {
+            id: usbVolSlider
+            bar: panel.bar
+            anchors.left: usbMuteBtn.right
+            anchors.right: usbVolText.left
+            anchors.leftMargin: Style.spacing.xs
+            anchors.rightMargin: Style.spacing.xs
+            anchors.verticalCenter: parent.verticalCenter
+            minimum: 0
+            maximum: 100
+            step: 2
+            integer: true
+            value: panel.usbVolume >= 0 ? panel.usbVolume : 0
+            onReleased: function(v) { panel.setUsbVolume(v); }
+            onRightClicked: panel.toggleUsbMute()
+          }
+
+          Text {
+            id: usbVolText
+            textFormat: Text.PlainText
+            width: Style.space(38)
+            anchors.right: parent.right
+            anchors.verticalCenter: parent.verticalCenter
+            horizontalAlignment: Text.AlignRight
+            text: Model.neutralizeMarkup(
+              panel.usbMuted
+                ? "MUTE"
+                : Math.round(usbVolSlider.dragging ? usbVolSlider.liveValue : Math.max(0, panel.usbVolume)) + "%"
+            )
+            color: panel.usbMuted ? panel.urgColor : panel.fgColor
+            font.family: panel.fontFam
+            font.pixelSize: Style.font.caption
+          }
+        }
+      }
+    }
+
     // ── Battery Status Card ──
     Rectangle {
-      visible: panel.battery >= 0
+      visible: panel.battery >= 0 || panel.charging || panel.usbConnected
       width: parent.width
       height: battCardCol.implicitHeight + Style.spacing.md * 2
       radius: Style.cornerRadius
@@ -525,7 +768,13 @@ Panel {
           Text {
             textFormat: Text.PlainText
             anchors.verticalCenter: parent.verticalCenter
-            text: Model.neutralizeMarkup(panel.tr("battery.headset") + "  " + Model.formatBattery(panel.battery))
+            text: Model.neutralizeMarkup(
+              (panel.usbConnected && !panel.rcspConnected)
+                ? (panel.tr("battery.headset") + "  " + panel.tr("battery.charging"))
+                : (panel.battery >= 0
+                    ? (panel.tr("battery.headset") + "  " + Model.formatBattery(panel.battery))
+                    : (panel.tr("battery.headset") + "  " + panel.tr("battery.charging")))
+            )
             color: panel.fgColor
             font.family: panel.fontFam
             font.pixelSize: Style.font.body
@@ -535,15 +784,19 @@ Panel {
           Text {
             textFormat: Text.PlainText
             anchors.verticalCenter: parent.verticalCenter
-            visible: panel.charging || !panel.connected || panel.rcspConnected
+            visible: panel.charging || !panel.connected || panel.rcspConnected || panel.usbConnected
             text: Model.neutralizeMarkup(
-              panel.charging
-                ? ("· " + panel.tr("battery.charging"))
-                : (!panel.connected
-                    ? ("· " + panel.tr("status.beacon"))
-                    : (panel.rcspConnected ? ("· " + panel.tr("status.rcsp_live")) : ""))
+              (panel.usbConnected && !panel.rcspConnected)
+                ? (panel.battery >= 0
+                    ? ("· " + panel.tr("battery.last_bt") + ": " + Model.formatBattery(panel.battery))
+                    : ("· " + panel.tr("status.usb_short")))
+                : (panel.charging
+                    ? ("· " + panel.tr("battery.charging"))
+                    : (!panel.connected
+                        ? ("· " + panel.tr("status.beacon"))
+                        : (panel.rcspConnected ? ("· " + panel.tr("status.rcsp_live")) : "")))
             )
-            color: panel.charging ? panel.accColor : panel.dimColor
+            color: (panel.charging && !(panel.usbConnected && !panel.rcspConnected)) ? panel.accColor : panel.dimColor
             font.family: panel.fontFam
             font.pixelSize: Style.font.caption
           }
@@ -557,12 +810,17 @@ Panel {
           color: Qt.rgba(panel.fgColor.r, panel.fgColor.g, panel.fgColor.b, 0.14)
 
           Rectangle {
-            width: parent.width * Math.max(0, Math.min(1, panel.battery / 100.0))
+            width: parent.width * (
+              (panel.usbConnected && !panel.rcspConnected) || panel.battery < 0
+                ? 1.0
+                : Math.max(0, Math.min(1, panel.battery / 100.0))
+            )
             height: parent.height
             radius: parent.radius
-            color: (panel.battery <= 15 && !panel.charging)
+            color: (panel.battery >= 0 && panel.battery <= 15 && !panel.charging)
               ? panel.urgColor
               : panel.accColor
+            opacity: ((panel.usbConnected && !panel.rcspConnected) || panel.battery < 0) ? 0.72 : 1.0
 
             Behavior on width {
               NumberAnimation {
@@ -571,6 +829,21 @@ Panel {
               }
             }
           }
+        }
+
+        Text {
+          textFormat: Text.PlainText
+          visible: panel.usbConnected && !panel.rcspConnected
+          width: parent.width
+          text: Model.neutralizeMarkup(
+            panel.battery >= 0
+              ? panel.tr("battery.usb_cached_hint")
+              : panel.tr("battery.usb_unknown_hint")
+          )
+          color: panel.dimColor
+          font.family: panel.fontFam
+          font.pixelSize: Style.font.caption
+          wrapMode: Text.WordWrap
         }
 
         // Optional Left / Right / Case breakdown if reported
@@ -608,17 +881,51 @@ Panel {
       }
     }
 
+    // ── Error Banner (if any) ──
+    Text {
+      textFormat: Text.PlainText
+      visible: panel.errorText !== ""
+      width: parent.width
+      text: Model.neutralizeMarkup(panel.errorText)
+      color: panel.urgColor
+      font.family: panel.fontFam
+      font.pixelSize: Style.font.caption
+      wrapMode: Text.WordWrap
+    }
+
     PanelSeparator { foreground: panel.fgColor }
 
     // ── Noise Control (ANC / Transparency / Off) ──
-    PanelSectionHeader {
-      text: Model.neutralizeMarkup(panel.tr("section.anc"))
-      foreground: panel.fgColor
-      fontFamily: panel.fontFam
+    Item {
+      width: parent.width
+      height: Math.max(ancSectionHdr.implicitHeight, ancLockedText.implicitHeight)
+
+      PanelSectionHeader {
+        id: ancSectionHdr
+        anchors.left: parent.left
+        anchors.verticalCenter: parent.verticalCenter
+        text: Model.neutralizeMarkup(panel.tr("section.anc"))
+        foreground: panel.fgColor
+        fontFamily: panel.fontFam
+      }
+
+      Text {
+        id: ancLockedText
+        textFormat: Text.PlainText
+        visible: panel.wiredOnly || !panel.ancAvailable
+        anchors.right: parent.right
+        anchors.verticalCenter: parent.verticalCenter
+        text: Model.neutralizeMarkup(panel.tr("anc.usb_unavailable"))
+        color: panel.dimColor
+        font.family: panel.fontFam
+        font.pixelSize: Style.font.caption
+      }
     }
 
     ButtonGroup {
       width: parent.width
+      enabled: panel.ancAvailable && panel.rcspConnected
+      opacity: (panel.ancAvailable && panel.rcspConnected) ? 1.0 : 0.45
       options: Model.ancOptions(panel.tr)
       value: panel.anc
       foreground: panel.fgColor
@@ -629,7 +936,9 @@ Panel {
 
     // ANC Strength Level (Light / Balanced / Deep) + Adaptive ANC when ANC is active
     Column {
-      visible: panel.anc === "anc"
+      visible: panel.anc === "anc" && panel.ancAvailable
+      enabled: panel.ancAvailable && panel.rcspConnected
+      opacity: (panel.ancAvailable && panel.rcspConnected) ? 1.0 : 0.45
       width: parent.width
       spacing: Style.spacing.sm
 
@@ -662,7 +971,9 @@ Panel {
 
     // Transparency Sub-Mode (Regular / Enhance Voice / Ambient) when Transparency is active
     Column {
-      visible: panel.anc === "transparency"
+      visible: panel.anc === "transparency" && panel.ancAvailable
+      enabled: panel.ancAvailable && panel.rcspConnected
+      opacity: (panel.ancAvailable && panel.rcspConnected) ? 1.0 : 0.45
       width: parent.width
       spacing: Style.spacing.sm
 
@@ -686,14 +997,38 @@ Panel {
     PanelSeparator { foreground: panel.fgColor }
 
     // ── Equalizer Presets & 10-Band Custom EQ ──
-    PanelSectionHeader {
-      text: Model.neutralizeMarkup(panel.tr("section.eq"))
-      foreground: panel.fgColor
-      fontFamily: panel.fontFam
+    Item {
+      width: parent.width
+      height: Math.max(eqSectionHdr.implicitHeight, eqBtOnlyText.implicitHeight)
+
+      PanelSectionHeader {
+        id: eqSectionHdr
+        anchors.left: parent.left
+        anchors.verticalCenter: parent.verticalCenter
+        text: Model.neutralizeMarkup(panel.tr("section.eq"))
+        foreground: panel.fgColor
+        fontFamily: panel.fontFam
+      }
+
+      Text {
+        id: eqBtOnlyText
+        textFormat: Text.PlainText
+        visible: panel.wiredOnly || !panel.eqAvailable || !panel.rcspConnected
+        anchors.right: parent.right
+        anchors.verticalCenter: parent.verticalCenter
+        text: Model.neutralizeMarkup(
+          (panel.wiredOnly || !panel.eqAvailable) ? panel.tr("eq.usb_unavailable") : panel.tr("section.bt_only")
+        )
+        color: panel.dimColor
+        font.family: panel.fontFam
+        font.pixelSize: Style.font.caption
+      }
     }
 
     Column {
       width: parent.width
+      enabled: panel.eqAvailable && panel.rcspConnected
+      opacity: (panel.eqAvailable && panel.rcspConnected) ? 1.0 : 0.45
       spacing: Style.space(5)
 
       Flickable {
@@ -764,7 +1099,9 @@ Panel {
 
     // 10-Band Custom Equalizer Sliders (shown when Custom EQ is selected)
     Column {
-      visible: panel.eq === "custom"
+      visible: panel.eq === "custom" && panel.eqAvailable
+      enabled: panel.eqAvailable && panel.rcspConnected
+      opacity: (panel.eqAvailable && panel.rcspConnected) ? 1.0 : 0.45
       width: parent.width
       spacing: Style.spacing.xs
 
@@ -868,11 +1205,37 @@ Panel {
     PanelSeparator { foreground: panel.fgColor }
 
     // ── Device Features & Controls ──
-    PanelSectionHeader {
-      text: Model.neutralizeMarkup(panel.tr("section.features"))
-      foreground: panel.fgColor
-      fontFamily: panel.fontFam
+    Item {
+      width: parent.width
+      height: Math.max(featSectionHdr.implicitHeight, featBtOnlyText.implicitHeight)
+
+      PanelSectionHeader {
+        id: featSectionHdr
+        anchors.left: parent.left
+        anchors.verticalCenter: parent.verticalCenter
+        text: Model.neutralizeMarkup(panel.tr("section.features"))
+        foreground: panel.fgColor
+        fontFamily: panel.fontFam
+      }
+
+      Text {
+        id: featBtOnlyText
+        textFormat: Text.PlainText
+        visible: !panel.rcspConnected
+        anchors.right: parent.right
+        anchors.verticalCenter: parent.verticalCenter
+        text: Model.neutralizeMarkup(panel.tr("section.bt_only"))
+        color: panel.dimColor
+        font.family: panel.fontFam
+        font.pixelSize: Style.font.caption
+      }
     }
+
+    Column {
+      width: parent.width
+      enabled: panel.rcspConnected
+      opacity: panel.rcspConnected ? 1.0 : 0.45
+      spacing: Style.spacing.sm
 
     Toggle {
       width: parent.width
@@ -882,6 +1245,7 @@ Panel {
       accent: panel.accColor
       fontFamily: panel.fontFam
       onClicked: {
+        if (!panel.rcspConnected) return;
         panel.multipoint = !panel.multipoint;
         panel.runCtl(["multipoint", panel.multipoint ? "on" : "off"]);
       }
@@ -895,6 +1259,7 @@ Panel {
       accent: panel.accColor
       fontFamily: panel.fontFam
       onClicked: {
+        if (!panel.rcspConnected) return;
         panel.gameMode = !panel.gameMode;
         panel.runCtl(["game-mode", panel.gameMode ? "on" : "off"]);
       }
@@ -908,6 +1273,7 @@ Panel {
       accent: panel.accColor
       fontFamily: panel.fontFam
       onClicked: {
+        if (!panel.rcspConnected) return;
         panel.autoAnswer = !panel.autoAnswer;
         panel.runCtl(["auto-answer", panel.autoAnswer ? "on" : "off"]);
       }
@@ -944,10 +1310,12 @@ Panel {
         horizontalPadding: Style.spacing.sm
         verticalPadding: Style.space(4)
         onClicked: {
+          if (!panel.rcspConnected) return;
           panel.finding = !panel.finding;
           panel.runCtl(["find", panel.finding ? "on" : "off"]);
         }
       }
+    }
     }
 
     PanelSeparator { foreground: panel.fgColor }
@@ -967,6 +1335,8 @@ Panel {
 
     Column {
       visible: panel.showGestures
+      enabled: panel.rcspConnected
+      opacity: panel.rcspConnected ? 1.0 : 0.45
       width: parent.width
       spacing: Style.spacing.xs
 
@@ -1087,18 +1457,6 @@ Panel {
           }
         }
       }
-    }
-
-    // ── Error Banner (if any) ──
-    Text {
-      textFormat: Text.PlainText
-      visible: panel.errorText !== ""
-      width: parent.width
-      text: Model.neutralizeMarkup(panel.errorText)
-      color: panel.urgColor
-      font.family: panel.fontFam
-      font.pixelSize: Style.font.caption
-      wrapMode: Text.WordWrap
     }
         }
       }

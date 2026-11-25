@@ -480,6 +480,268 @@ def query_audio_codec(mac: str) -> dict[str, str | None]:
     return {"codec": None, "profile": None}
 
 
+def _read_sysfs_text(path: Path) -> str | None:
+    try:
+        return path.read_text(encoding="utf-8", errors="ignore").strip()
+    except OSError:
+        return None
+
+
+def _format_sample_rate_khz(hz: int) -> str:
+    if hz <= 0:
+        return ""
+    if hz % 1000 == 0:
+        return f"{hz // 1000}kHz"
+    khz = hz / 1000.0
+    return f"{khz:.1f}kHz"
+
+
+def query_usb_redmi_neo(sysfs_usb_root: Path = Path("/sys/bus/usb/devices")) -> dict[str, Any] | None:
+    """Detects REDMI Headphones Neo (VID 0x2717 / PID 0x50F0) connected via USB-C cable."""
+    target_vid = f"{protocol.VENDOR_ID:04x}"
+    target_pid = f"{protocol.PRODUCT_ID:04x}"
+    try:
+        if not sysfs_usb_root.exists():
+            return None
+        for entry in sorted(sysfs_usb_root.iterdir(), key=lambda p: p.name):
+            if ":" in entry.name or not entry.is_dir():
+                continue
+            vid = (_read_sysfs_text(entry / "idVendor") or "").lower()
+            pid = (_read_sysfs_text(entry / "idProduct") or "").lower()
+            if vid != target_vid or pid != target_pid:
+                continue
+            authorized = _read_sysfs_text(entry / "authorized")
+            if authorized == "0":
+                continue
+            return {
+                "vid": vid,
+                "pid": pid,
+                "product": _read_sysfs_text(entry / "product") or protocol.DEVICE_NAME_DEFAULT,
+                "manufacturer": _read_sysfs_text(entry / "manufacturer"),
+                "serial": _read_sysfs_text(entry / "serial"),
+                "bcd_device": _read_sysfs_text(entry / "bcdDevice"),
+                "max_power": _read_sysfs_text(entry / "bMaxPower"),
+                "sysfs_path": str(entry),
+            }
+    except OSError:
+        return None
+    return None
+
+
+def _parse_alsa_stream0(text: str) -> dict[str, str | None]:
+    """Extracts active or preferred playback bit depth and sample rate from ALSA `stream0`."""
+    if not text:
+        return {"codec": None, "status": None}
+    lines = text.splitlines()
+    playback_lines: list[str] = []
+    in_playback = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("Playback:"):
+            in_playback = True
+            continue
+        if in_playback and stripped.startswith("Capture:"):
+            break
+        if in_playback:
+            playback_lines.append(line)
+
+    pb_text = "\n".join(playback_lines)
+    if not pb_text:
+        return {"codec": None, "status": None}
+
+    status_match = re.search(r"Status:\s*(\w+)", pb_text)
+    status = status_match.group(1) if status_match else None
+    active_alt_m = re.search(r"Altset\s*=\s*(\d+)", pb_text)
+    active_alt = active_alt_m.group(1) if active_alt_m else None
+    freq_m = re.search(r"Momentary freq\s*=\s*(\d+)\s*Hz", pb_text)
+    freq_hz = int(freq_m.group(1)) if freq_m else None
+
+    altsets: dict[str, tuple[int | None, int | None]] = {}
+    cur_alt: str | None = None
+    for line in playback_lines:
+        m_alt = re.match(r"^\s*Altset\s+(\d+)\s*$", line)
+        if m_alt:
+            cur_alt = m_alt.group(1)
+            altsets.setdefault(cur_alt, (None, None))
+            continue
+        if cur_alt is not None:
+            bits, default_rate = altsets[cur_alt]
+            m_bits = re.search(r"\bBits:\s*(\d+)", line)
+            if m_bits:
+                bits = int(m_bits.group(1))
+            m_rates = re.search(r"\bRates:\s*([0-9,\s]+)", line)
+            if m_rates:
+                rates = [int(r) for r in re.findall(r"\d+", m_rates.group(1))]
+                if 48000 in rates:
+                    default_rate = 48000
+                elif rates:
+                    default_rate = rates[0]
+            altsets[cur_alt] = (bits, default_rate)
+
+    chosen_bits: int | None = None
+    chosen_rate: int | None = freq_hz
+    if active_alt and active_alt in altsets:
+        chosen_bits, alt_rate = altsets[active_alt]
+        if chosen_rate is None:
+            chosen_rate = alt_rate
+    elif altsets:
+        best_alt = max(altsets.values(), key=lambda pair: pair[0] or 0)
+        chosen_bits, alt_rate = best_alt
+        if chosen_rate is None:
+            chosen_rate = alt_rate
+
+    if chosen_bits and chosen_rate:
+        codec = f"PCM {chosen_bits}-bit/{_format_sample_rate_khz(chosen_rate)}"
+    elif chosen_bits:
+        codec = f"PCM {chosen_bits}-bit"
+    elif chosen_rate:
+        codec = f"PCM {_format_sample_rate_khz(chosen_rate)}"
+    else:
+        codec = None
+    return {"codec": codec, "status": status}
+
+
+def _parse_pactl_usb_audio(
+    sinks_stdout: str,
+    cards_stdout: str = "",
+    default_sink: str = "",
+) -> dict[str, Any]:
+    """Extracts PipeWire USB audio format, profile, volume, mute, and default status for 2717:50F0."""
+    codec: str | None = None
+    profile: str | None = None
+    sink_name: str | None = None
+    volume_pct: int | None = None
+    muted = False
+    is_default = False
+
+    for blk in (sinks_stdout or "").split("Sink #"):
+        low = blk.lower()
+        if not (
+            ('device.vendor.id = "0x2717"' in low and 'device.product.id = "0x50f0"' in low)
+            or ("redmi headphones neo" in low and 'device.bus = "usb"' in low)
+        ):
+            continue
+        m_name = re.search(r"^\s*Name:\s*([^\n]+)", blk, re.MULTILINE)
+        if m_name:
+            sink_name = m_name.group(1).strip()
+            is_default = bool(default_sink and sink_name == default_sink.strip())
+        m_spec = re.search(r"Sample Specification:\s*([A-Za-z0-9_]+)\s+\d+ch\s+(\d+)Hz", blk)
+        if m_spec:
+            fmt = m_spec.group(1).lower()
+            hz = int(m_spec.group(2))
+            bits_m = re.search(r"(\d+)", fmt)
+            bits = int(bits_m.group(1)) if bits_m else None
+            if bits and hz:
+                codec = f"PCM {bits}-bit/{_format_sample_rate_khz(hz)}"
+            elif bits:
+                codec = f"PCM {bits}-bit"
+        m_mute = re.search(r"^\s*Mute:\s*(yes|no)", blk, re.IGNORECASE | re.MULTILINE)
+        if m_mute:
+            muted = m_mute.group(1).lower() == "yes"
+        m_vol = re.search(r"^\s*Volume:[^\n]*?(\d+)%", blk, re.MULTILINE)
+        if m_vol:
+            volume_pct = max(0, min(150, int(m_vol.group(1))))
+        break
+
+    for blk in (cards_stdout or "").split("Card #"):
+        low = blk.lower()
+        if not (
+            ('device.vendor.id = "0x2717"' in low and 'device.product.id = "0x50f0"' in low)
+            or ("redmi headphones neo" in low and 'device.bus = "usb"' in low)
+        ):
+            continue
+        m_prof = re.search(r"Active Profile:\s*([^\n]+)", blk)
+        if m_prof:
+            raw_prof = m_prof.group(1).strip().lower()
+            if "output:" in raw_prof and "input:" in raw_prof:
+                profile = "USB-C Duplex"
+            elif "output:" in raw_prof:
+                profile = "USB-C Audio"
+            elif raw_prof and raw_prof != "off":
+                profile = "USB-C"
+        break
+
+    return {
+        "codec": codec,
+        "profile": profile,
+        "sink_name": sink_name,
+        "volume": volume_pct,
+        "muted": muted,
+        "is_default": is_default,
+    }
+
+
+def query_usb_audio_info(
+    asound_root: Path = Path("/proc/asound"),
+    use_pactl: bool = True,
+) -> dict[str, Any]:
+    """Queries ALSA `/proc/asound` and PipeWire (`pactl`) for wired USB-C audio format, profile, and sink state."""
+    target_usbid = f"{protocol.VENDOR_ID:04x}:{protocol.PRODUCT_ID:04x}"
+    alsa_codec: str | None = None
+    alsa_running = False
+
+    try:
+        if asound_root.exists():
+            for card_dir in sorted(asound_root.glob("card*"), key=lambda p: p.name):
+                if not card_dir.is_dir():
+                    continue
+                usbid = (_read_sysfs_text(card_dir / "usbid") or "").lower()
+                if usbid != target_usbid:
+                    continue
+                stream_txt = _read_sysfs_text(card_dir / "stream0") or ""
+                parsed = _parse_alsa_stream0(stream_txt)
+                alsa_codec = parsed.get("codec")
+                alsa_running = parsed.get("status") == "Running"
+                break
+    except OSError:
+        pass
+
+    pw_info: dict[str, Any] = {}
+    if use_pactl:
+        try:
+            sinks_proc = subprocess.run(
+                ["pactl", "list", "sinks"],
+                capture_output=True,
+                text=True,
+                timeout=1.5,
+                check=False,
+            )
+            cards_proc = subprocess.run(
+                ["pactl", "list", "cards"],
+                capture_output=True,
+                text=True,
+                timeout=1.5,
+                check=False,
+            )
+            def_proc = subprocess.run(
+                ["pactl", "get-default-sink"],
+                capture_output=True,
+                text=True,
+                timeout=1.0,
+                check=False,
+            )
+            pw_info = _parse_pactl_usb_audio(
+                sinks_proc.stdout if sinks_proc.returncode == 0 else "",
+                cards_proc.stdout if cards_proc.returncode == 0 else "",
+                def_proc.stdout if def_proc.returncode == 0 else "",
+            )
+        except Exception:
+            pass
+
+    pw_codec = pw_info.get("codec")
+    pw_profile = pw_info.get("profile")
+    codec = alsa_codec if (alsa_running and alsa_codec) else (pw_codec or alsa_codec or "USB Audio")
+    profile = pw_profile or "USB-C"
+    return {
+        "codec": codec,
+        "profile": profile,
+        "sink_name": pw_info.get("sink_name"),
+        "volume": pw_info.get("volume"),
+        "muted": bool(pw_info.get("muted", False)),
+        "is_default": bool(pw_info.get("is_default", False)),
+    }
+
+
 def bluez_connect_device(mac: str, connect: bool) -> tuple[bool, str | None]:
     """Connects or disconnects the device via BlueZ D-Bus (with bluetoothctl fallback)."""
     action = "connect" if connect else "disconnect"
@@ -574,7 +836,9 @@ class RedmiNeoDaemon:
         self._connecting_rfcomm = False
         self._last_rfcomm_attempt = 0.0
         self._last_bluez_refresh = 0.0
+        self._last_bluez_devices: list[dict[str, Any]] = []
         self._last_codec_check = 0.0
+        self._last_usb_audio_check = 0.0
         # Monotonic time of the latest user write *intent* (set before the optimistic state
         # update). Any read whose request left before this instant carries pre-write data.
         self._last_write_ts = 0.0
@@ -593,6 +857,9 @@ class RedmiNeoDaemon:
         # Initialize state from persisted config so the UI always has rich context
         self.state: dict[str, Any] = {
             "connected": False,
+            "bluetooth_connected": False,
+            "usb_connected": False,
+            "connection_type": "none",
             "rcsp_connected": False,
             "connecting": False,
             "name": self._cfg.get("name", protocol.DEVICE_NAME_DEFAULT),
@@ -603,7 +870,14 @@ class RedmiNeoDaemon:
             "pid": self._cfg.get("pid", "50f0"),
             "firmware": self._cfg.get("firmware"),
             "battery": self._cfg.get("last_battery"),
-            "charging": bool(self._cfg.get("last_charging", False)),
+            "charging": False,
+            "usb_charging": False,
+            "usb_serial": None,
+            "usb_max_power": None,
+            "usb_sink_name": None,
+            "usb_volume": None,
+            "usb_muted": False,
+            "usb_default_audio": False,
             "battery_source": self._cfg.get("battery_source"),
             "battery_left": None,
             "battery_right": None,
@@ -634,6 +908,16 @@ class RedmiNeoDaemon:
             "devices": [],
             "error": None,
         }
+        self._bt_anc_cache: tuple[str, str, bool] = (
+            str(self.state["anc"]),
+            str(self.state["anc_level"]),
+            bool(self.state["adaptive_anc"]),
+        )
+        self._bt_eq_cache: tuple[str, list[int]] = (
+            str(self.state["eq"]),
+            list(self.state["eq_bands"]),
+        )
+        self._bt_battery_cache: int | None = self.state.get("battery")
         if len(self.state["eq_bands"]) != 10:
             self.state["eq_bands"] = [0] * 10
 
@@ -645,6 +929,7 @@ class RedmiNeoDaemon:
 
     def _persist_state(self) -> None:
         with self._lock:
+            usb_only = bool(self.state.get("usb_connected")) and not bool(self.state.get("bluetooth_connected"))
             for key in (
                 "mac",
                 "name",
@@ -665,8 +950,13 @@ class RedmiNeoDaemon:
                 "anc_cycle",
                 "battery_source",
             ):
+                if usb_only and key in ("anc", "anc_level", "adaptive_anc", "eq", "eq_bands"):
+                    continue
                 if self.state.get(key) is not None:
                     self._cfg[key] = self.state[key]
+            if usb_only:
+                self._cfg["anc"], self._cfg["anc_level"], self._cfg["adaptive_anc"] = self._bt_anc_cache
+                self._cfg["eq"], self._cfg["eq_bands"] = self._bt_eq_cache[0], list(self._bt_eq_cache[1])
             if self.state.get("battery") is not None:
                 self._cfg["last_battery"] = self.state["battery"]
                 self._cfg["last_charging"] = bool(self.state.get("charging", False))
@@ -688,22 +978,27 @@ class RedmiNeoDaemon:
             snap["devices"] = [dict(d) for d in (self.state.get("devices") or [])]
             return snap
 
-    # ── BlueZ & System Refresh ──
+    # ── BlueZ & USB System Refresh ──
 
     def refresh_bluez(self, force_codec: bool = False, min_interval: float = 0.0) -> None:
-        now_check = time.monotonic()
-        if not force_codec and min_interval > 0.0 and (now_check - self._last_bluez_refresh) < min_interval:
-            return
-
         with self._refresh_lock:
             now_check = time.monotonic()
-            if not force_codec and min_interval > 0.0 and (now_check - self._last_bluez_refresh) < min_interval:
-                return
-            self._last_bluez_refresh = now_check
-
-            devices = query_bluez_devices()
+            usb_dev = query_usb_redmi_neo()
+            usb_connected = usb_dev is not None
             with self._lock:
+                was_usb_connected = bool(self.state.get("usb_connected"))
                 preferred_mac = (self.state.get("mac") or "").upper()
+
+            usb_changed = usb_connected != was_usb_connected
+            need_bluez = force_codec or usb_changed or min_interval <= 0.0 or (
+                (now_check - self._last_bluez_refresh) >= min_interval
+            )
+            if need_bluez:
+                self._last_bluez_refresh = now_check
+                devices = query_bluez_devices()
+                self._last_bluez_devices = devices
+            else:
+                devices = list(self._last_bluez_devices)
 
             chosen: dict[str, Any] | None = None
             # 1. Match preferred MAC if present
@@ -731,35 +1026,118 @@ class RedmiNeoDaemon:
             if chosen is None and devices:
                 chosen = next((d for d in devices if d.get("connected")), devices[0])
 
+            bt_connected = bool(chosen and chosen.get("connected"))
             audio_info: dict[str, str | None] | None = None
-            if chosen is not None and bool(chosen.get("connected")):
-                now = time.monotonic()
+            usb_audio_info: dict[str, str | None] | None = None
+            now = time.monotonic()
+
+            if bt_connected and chosen is not None:
                 if force_codec or (now - self._last_codec_check > 5.0):
                     self._last_codec_check = now
                     audio_info = query_audio_codec(chosen["mac"])
 
-            with self._lock:
-                ui_devices = [
-                    {
-                        "mac": d["mac"],
-                        "name": d["alias"] or d["name"],
-                        "connected": d["connected"],
-                        "is_redmi_neo": d["is_redmi_neo"],
-                        "battery": (
-                            d.get("bluez_battery") if d.get("bluez_battery") is not None else d.get("beacon_battery")
-                        ),
-                    }
-                    for d in devices
-                ]
-                self.state["devices"] = ui_devices
+            if usb_connected:
+                run_pactl = force_codec or usb_changed or (now - self._last_usb_audio_check > 5.0)
+                if run_pactl:
+                    self._last_usb_audio_check = now
+                usb_audio_info = query_usb_audio_info(use_pactl=run_pactl)
 
+            with self._lock:
+                if need_bluez:
+                    ui_devices = [
+                        {
+                            "mac": d["mac"],
+                            "name": d["alias"] or d["name"],
+                            "connected": d["connected"],
+                            "is_redmi_neo": d["is_redmi_neo"],
+                            "battery": (
+                                d.get("bluez_battery")
+                                if d.get("bluez_battery") is not None
+                                else d.get("beacon_battery")
+                            ),
+                        }
+                        for d in devices
+                    ]
+                    self.state["devices"] = ui_devices
+
+                was_bt_connected = bool(self.state.get("bluetooth_connected"))
+                now_connected = bt_connected or usb_connected
+                if usb_connected and bt_connected:
+                    conn_type = "usb+bluetooth"
+                elif usb_connected:
+                    conn_type = "usb"
+                elif bt_connected:
+                    conn_type = "bluetooth"
+                else:
+                    conn_type = "none"
+
+                self.state["bluetooth_connected"] = bt_connected
+                self.state["usb_connected"] = usb_connected
+                self.state["connection_type"] = conn_type
+                self.state["connected"] = now_connected
+                self.state["usb_charging"] = usb_connected
+
+                if usb_dev is not None:
+                    self.state["usb_serial"] = usb_dev.get("serial")
+                    self.state["usb_max_power"] = usb_dev.get("max_power")
+                    if not self.state.get("name"):
+                        self.state["name"] = usb_dev.get("product") or protocol.DEVICE_NAME_DEFAULT
+                    if usb_dev.get("vid"):
+                        self.state["vid"] = usb_dev["vid"]
+                    if usb_dev.get("pid"):
+                        self.state["pid"] = usb_dev["pid"]
+                    if usb_changed:
+                        self.state["error"] = None
+                else:
+                    self.state["usb_serial"] = None
+                    self.state["usb_max_power"] = None
+                    self.state["usb_sink_name"] = None
+                    self.state["usb_volume"] = None
+                    self.state["usb_muted"] = False
+                    self.state["usb_default_audio"] = False
+                    if usb_changed:
+                        self.state["error"] = None
+
+                # USB-C wired mode turns off ANC and defaults EQ to Balanced on the headset;
+                # RCSP-only hardware controls are unavailable without Bluetooth.
+                usb_only = usb_connected and not bt_connected
+                if usb_only:
+                    if not was_usb_connected or self.state.get("anc_available", True):
+                        self._bt_anc_cache = (
+                            str(self.state.get("anc") or "off"),
+                            str(self.state.get("anc_level") or "balanced"),
+                            bool(self.state.get("adaptive_anc", False)),
+                        )
+                        self._bt_eq_cache = (
+                            str(self.state.get("eq") or "balanced"),
+                            list(self.state.get("eq_bands") or [0] * 10),
+                        )
+                        if self.state.get("battery") is not None:
+                            self._bt_battery_cache = int(self.state["battery"])
+                    self.state["anc"] = "off"
+                    self.state["adaptive_anc"] = False
+                    self.state["anc_available"] = False
+                    self.state["eq"] = "balanced"
+                    self.state["eq_available"] = False
+                    self.state["finding"] = False
+                else:
+                    was_unavailable = not bool(self.state.get("anc_available", True))
+                    self.state["anc_available"] = True
+                    self.state["eq_available"] = True
+                    if was_unavailable and not self.state.get("rcsp_connected"):
+                        self.state["anc"], self.state["anc_level"], self.state["adaptive_anc"] = self._bt_anc_cache
+                        self.state["eq"], self.state["eq_bands"] = (
+                            self._bt_eq_cache[0],
+                            list(self._bt_eq_cache[1]),
+                        )
+                        if self.state.get("battery") is None and self._bt_battery_cache is not None:
+                            self.state["battery"] = self._bt_battery_cache
+
+                has_live_batt = False
                 if chosen is not None:
                     mac = chosen["mac"]
-                    was_connected = bool(self.state.get("connected"))
-                    now_connected = bool(chosen.get("connected"))
                     self.state["mac"] = mac
                     self.state["name"] = chosen.get("alias") or chosen.get("name") or protocol.DEVICE_NAME_DEFAULT
-                    self.state["connected"] = now_connected
                     if chosen.get("vid"):
                         self.state["vid"] = chosen["vid"]
                     if chosen.get("pid"):
@@ -769,40 +1147,71 @@ class RedmiNeoDaemon:
                     # if RCSP hasn't provided a fresher reading while connected
                     if chosen.get("bluez_battery") is not None and not self.state.get("rcsp_connected"):
                         self.state["battery"] = chosen["bluez_battery"]
+                        self._bt_battery_cache = int(chosen["bluez_battery"])
                         self.state["battery_source"] = "bluez"
+                        has_live_batt = True
                     elif chosen.get("beacon_battery") is not None and (
                         self.state.get("battery") is None or not self.state.get("rcsp_connected")
                     ):
                         self.state["battery"] = chosen["beacon_battery"]
-                        self.state["charging"] = bool(chosen.get("beacon_charging", False))
+                        self._bt_battery_cache = int(chosen["beacon_battery"])
+                        self.state["charging"] = bool(chosen.get("beacon_charging", False)) or usb_connected
                         self.state["battery_source"] = "beacon"
+                        has_live_batt = True
 
-                    if not now_connected:
-                        self.state["rcsp_connected"] = False
-                        self.state["codec"] = None
-                        self.state["profile"] = None
+                if not bt_connected:
+                    self.state["rcsp_connected"] = False
+                    if was_bt_connected:
+                        self._close_rfcomm()
+                    if not usb_connected:
                         self.state["finding"] = False
-                        if was_connected:
-                            self._close_rfcomm()
-                    else:
-                        if audio_info is not None:
-                            self.state["codec"] = audio_info.get("codec")
-                            self.state["profile"] = audio_info.get("profile")
 
-                        # Ensure RFCOMM RCSP session is started if connected
-                        now = time.monotonic()
-                        if (
-                            self._rfcomm_sock is None
-                            and not self._connecting_rfcomm
-                            and (now - self._last_rfcomm_attempt > 1.5)
-                        ):
-                            self._last_rfcomm_attempt = now
-                            self._connecting_rfcomm = True
-                            threading.Thread(
-                                target=self._connect_rfcomm_worker,
-                                args=(mac,),
-                                daemon=True,
-                            ).start()
+                if usb_connected and not self.state.get("rcsp_connected"):
+                    self.state["charging"] = True
+                    # Do not show stale pre-cable battery % as live while charging over USB-C
+                    if not has_live_batt:
+                        if self.state.get("battery") is not None:
+                            self._bt_battery_cache = int(self.state["battery"])
+                        self.state["battery"] = None
+                        self.state["battery_source"] = "usb"
+
+                if not now_connected:
+                    self.state["codec"] = None
+                    self.state["profile"] = None
+                    self.state["finding"] = False
+                    if not (chosen and chosen.get("beacon_battery") is not None):
+                        self.state["charging"] = False
+                        if self.state.get("battery_source") in ("usb", "usb_cached"):
+                            self.state["battery_source"] = "cached" if self.state.get("battery") is not None else None
+                else:
+                    if bt_connected and audio_info is not None:
+                        self.state["codec"] = audio_info.get("codec")
+                        self.state["profile"] = audio_info.get("profile")
+                    if usb_connected and usb_audio_info is not None:
+                        if usb_audio_info.get("sink_name"):
+                            self.state["usb_sink_name"] = usb_audio_info.get("sink_name")
+                            self.state["usb_volume"] = usb_audio_info.get("volume")
+                            self.state["usb_muted"] = bool(usb_audio_info.get("muted", False))
+                            self.state["usb_default_audio"] = bool(usb_audio_info.get("is_default", False))
+                        # Prefer Bluetooth codec when A2DP/HFP is active, otherwise report USB-C PCM format
+                        if not bt_connected or not self.state.get("codec"):
+                            self.state["codec"] = usb_audio_info.get("codec")
+                            self.state["profile"] = usb_audio_info.get("profile")
+
+                if bt_connected and chosen is not None:
+                    mac = chosen["mac"]
+                    if (
+                        self._rfcomm_sock is None
+                        and not self._connecting_rfcomm
+                        and (now - self._last_rfcomm_attempt > 1.5)
+                    ):
+                        self._last_rfcomm_attempt = now
+                        self._connecting_rfcomm = True
+                        threading.Thread(
+                            target=self._connect_rfcomm_worker,
+                            args=(mac,),
+                            daemon=True,
+                        ).start()
 
         self._persist_state()
 
@@ -859,7 +1268,7 @@ class RedmiNeoDaemon:
             for attempt in range(3):
                 for ch in candidates:
                     with self._lock:
-                        if not self.state.get("connected") or self._stop_event.is_set():
+                        if not self.state.get("bluetooth_connected") or self._stop_event.is_set():
                             return
                     s = socket.socket(socket.AF_BLUETOOTH, socket.SOCK_STREAM, socket.BTPROTO_RFCOMM)
                     try:
@@ -884,7 +1293,7 @@ class RedmiNeoDaemon:
                 return
 
             with self._lock:
-                stale = self._rfcomm_sock is not None or not self.state.get("connected")
+                stale = self._rfcomm_sock is not None or not self.state.get("bluetooth_connected")
                 if not stale:
                     self._rfcomm_sock = connected_sock
                     self._rfcomm_mac = mac
@@ -911,9 +1320,9 @@ class RedmiNeoDaemon:
         with self._lock:
             if self._rfcomm_sock is not None and self._rfcomm_authenticated:
                 return True
-            connected = bool(self.state.get("connected"))
+            bt_connected = bool(self.state.get("bluetooth_connected"))
             mac = str(self.state.get("mac") or "").strip().upper()
-            if not connected or not mac:
+            if not bt_connected or not mac:
                 return False
             if self._rfcomm_sock is None and not self._connecting_rfcomm:
                 self._last_rfcomm_attempt = time.monotonic()
@@ -932,6 +1341,22 @@ class RedmiNeoDaemon:
             time.sleep(0.05)
         with self._lock:
             return self._rfcomm_sock is not None
+
+    def _require_rcsp_for_write(self, anc_action: bool = False) -> bool:
+        """Verifies RCSP availability before modifying device settings, setting an honest error otherwise."""
+        if self._ensure_rcsp_ready():
+            return True
+        with self._lock:
+            if self.state.get("usb_connected") and not self.state.get("bluetooth_connected"):
+                if anc_action:
+                    self.state["error"] = "ANC cannot be used over USB-C cable — default mode is Off"
+                else:
+                    self.state["error"] = "USB-C cable mode: this setting requires Bluetooth"
+            elif self.state.get("bluetooth_connected"):
+                self.state["error"] = "Bluetooth RCSP session not ready yet — please retry"
+            else:
+                self.state["error"] = "Connect headphones via Bluetooth to change hardware settings"
+        return False
 
     def _send_raw(self, data: bytes) -> bool:
         with self._lock:
@@ -1191,6 +1616,8 @@ class RedmiNeoDaemon:
             return self._snapshot_state()
 
         if cmd == "poll":
+            with self._lock:
+                self.state["error"] = None
             self.refresh_bluez(force_codec=True)
             if (time.monotonic() - self._last_write_ts) >= self.POLL_QUIET_AFTER_WRITE_SEC:
                 if self._ensure_rcsp_ready(timeout=1.2):
@@ -1218,6 +1645,11 @@ class RedmiNeoDaemon:
             self.refresh_bluez(force_codec=False, min_interval=1.0)
             with self._lock:
                 mac = str(req.get("mac") or self.state.get("mac") or "").strip().upper()
+                usb_only = bool(self.state.get("usb_connected")) and not bool(self.state.get("bluetooth_connected"))
+                if not want_connect and usb_only:
+                    self.state["connecting"] = False
+                    self.state["error"] = "Connected via USB-C cable — unplug cable to disconnect"
+                    return self._snapshot_state()
                 self.state["connecting"] = True
                 self.state["error"] = None
             if not mac:
@@ -1251,6 +1683,8 @@ class RedmiNeoDaemon:
                     order = ("off", "anc", "transparency")
                     mode = order[(order.index(cur_mode) + 1) % len(order)] if cur_mode in order else "anc"
                 if mode in protocol.ANC_MODE_TO_BYTE:
+                    if not self._require_rcsp_for_write(anc_action=True):
+                        return self._snapshot_state()
                     with self._lock:
                         self._begin_write()
                         need_trans_defer = mode == "transparency" and self.state.get("anc") != "transparency"
@@ -1265,26 +1699,25 @@ class RedmiNeoDaemon:
                                 self._pending_trans_due = time.monotonic() + 0.9
                         else:
                             self._pending_trans_apply = None
-                    if self._ensure_rcsp_ready():
-                        self._send_raw(protocol.build_set_anc_mode(self._mark_write_seq(), mode))
-                        if mode == "anc":
-                            time.sleep(0.05)
-                            self._send_raw(protocol.build_set_adaptive_anc(self._mark_write_seq(), adaptive))
-                            time.sleep(0.03)
-                            eff_lvl = (
-                                "adaptive"
-                                if adaptive
-                                else (anc_lvl if anc_lvl in protocol.ANC_LEVEL_TO_BYTE else "balanced")
-                            )
-                            self._send_raw(protocol.build_set_anc_level(self._mark_write_seq(), eff_lvl))
-                        elif (
-                            mode == "transparency"
-                            and not need_trans_defer
-                            and trans_lvl in protocol.TRANS_LEVEL_TO_BYTE
-                        ):
-                            time.sleep(0.05)
-                            self._send_raw(protocol.build_set_trans_level(self._mark_write_seq(), trans_lvl))
-                        self._touch_write_ts()
+                    self._send_raw(protocol.build_set_anc_mode(self._mark_write_seq(), mode))
+                    if mode == "anc":
+                        time.sleep(0.05)
+                        self._send_raw(protocol.build_set_adaptive_anc(self._mark_write_seq(), adaptive))
+                        time.sleep(0.03)
+                        eff_lvl = (
+                            "adaptive"
+                            if adaptive
+                            else (anc_lvl if anc_lvl in protocol.ANC_LEVEL_TO_BYTE else "balanced")
+                        )
+                        self._send_raw(protocol.build_set_anc_level(self._mark_write_seq(), eff_lvl))
+                    elif (
+                        mode == "transparency"
+                        and not need_trans_defer
+                        and trans_lvl in protocol.TRANS_LEVEL_TO_BYTE
+                    ):
+                        time.sleep(0.05)
+                        self._send_raw(protocol.build_set_trans_level(self._mark_write_seq(), trans_lvl))
+                    self._touch_write_ts()
                     self._persist_state()
             return self._snapshot_state()
 
@@ -1292,6 +1725,8 @@ class RedmiNeoDaemon:
             level = str(req.get("level") or "").lower()
             if level in protocol.ANC_LEVEL_TO_BYTE:
                 with self._write_lock:
+                    if not self._require_rcsp_for_write(anc_action=True):
+                        return self._snapshot_state()
                     with self._lock:
                         self._begin_write()
                         self._pending_trans_apply = None
@@ -1302,14 +1737,13 @@ class RedmiNeoDaemon:
                             self.state["anc_level"] = level
                         self.state["adaptive_anc"] = want_adaptive
                         self.state["error"] = None
-                    if self._ensure_rcsp_ready():
-                        if need_anc_mode:
-                            self._send_raw(protocol.build_set_anc_mode(self._mark_write_seq(), "anc"))
-                            time.sleep(0.05)
-                        self._send_raw(protocol.build_set_adaptive_anc(self._mark_write_seq(), want_adaptive))
-                        time.sleep(0.03)
-                        self._send_raw(protocol.build_set_anc_level(self._mark_write_seq(), level))
-                        self._touch_write_ts()
+                    if need_anc_mode:
+                        self._send_raw(protocol.build_set_anc_mode(self._mark_write_seq(), "anc"))
+                        time.sleep(0.05)
+                    self._send_raw(protocol.build_set_adaptive_anc(self._mark_write_seq(), want_adaptive))
+                    time.sleep(0.03)
+                    self._send_raw(protocol.build_set_anc_level(self._mark_write_seq(), level))
+                    self._touch_write_ts()
                     self._persist_state()
             return self._snapshot_state()
 
@@ -1317,6 +1751,8 @@ class RedmiNeoDaemon:
             level = str(req.get("level") or "").lower()
             if level in protocol.TRANS_LEVEL_TO_BYTE:
                 with self._write_lock:
+                    if not self._require_rcsp_for_write(anc_action=True):
+                        return self._snapshot_state()
                     with self._lock:
                         self._begin_write()
                         need_trans_mode = self.state.get("anc") != "transparency"
@@ -1328,18 +1764,19 @@ class RedmiNeoDaemon:
                             self._pending_trans_due = time.monotonic() + 0.9
                         else:
                             self._pending_trans_apply = None
-                    if self._ensure_rcsp_ready():
-                        if need_trans_mode:
-                            self._send_raw(protocol.build_set_anc_mode(self._mark_write_seq(), "transparency"))
-                        else:
-                            self._send_raw(protocol.build_set_trans_level(self._mark_write_seq(), level))
-                        self._touch_write_ts()
+                    if need_trans_mode:
+                        self._send_raw(protocol.build_set_anc_mode(self._mark_write_seq(), "transparency"))
+                    else:
+                        self._send_raw(protocol.build_set_trans_level(self._mark_write_seq(), level))
+                    self._touch_write_ts()
                     self._persist_state()
             return self._snapshot_state()
 
         if cmd == "adaptive-anc":
             enabled = bool(req.get("enabled"))
             with self._write_lock:
+                if not self._require_rcsp_for_write(anc_action=True):
+                    return self._snapshot_state()
                 with self._lock:
                     self._begin_write()
                     if enabled:
@@ -1353,17 +1790,16 @@ class RedmiNeoDaemon:
                         lvl = "balanced"
                         self.state["anc_level"] = lvl
                     self.state["error"] = None
-                if self._ensure_rcsp_ready():
-                    if need_anc_mode and enabled:
-                        self._send_raw(protocol.build_set_anc_mode(self._mark_write_seq(), "anc"))
-                        time.sleep(0.05)
-                    self._send_raw(protocol.build_set_adaptive_anc(self._mark_write_seq(), enabled))
-                    time.sleep(0.03)
-                    if enabled:
-                        self._send_raw(protocol.build_set_anc_level(self._mark_write_seq(), "adaptive"))
-                    else:
-                        self._send_raw(protocol.build_set_anc_level(self._mark_write_seq(), lvl))
-                    self._touch_write_ts()
+                if need_anc_mode and enabled:
+                    self._send_raw(protocol.build_set_anc_mode(self._mark_write_seq(), "anc"))
+                    time.sleep(0.05)
+                self._send_raw(protocol.build_set_adaptive_anc(self._mark_write_seq(), enabled))
+                time.sleep(0.03)
+                if enabled:
+                    self._send_raw(protocol.build_set_anc_level(self._mark_write_seq(), "adaptive"))
+                else:
+                    self._send_raw(protocol.build_set_anc_level(self._mark_write_seq(), lvl))
+                self._touch_write_ts()
                 self._persist_state()
             return self._snapshot_state()
 
@@ -1371,17 +1807,18 @@ class RedmiNeoDaemon:
             preset = str(req.get("preset") or "").lower()
             if preset in protocol.EQ_PRESET_TO_BYTE:
                 with self._write_lock:
+                    if not self._require_rcsp_for_write():
+                        return self._snapshot_state()
                     with self._lock:
                         self._begin_write()
                         self.state["eq"] = preset
                         self.state["error"] = None
                         bands = list(self.state.get("eq_bands") or [0] * 10)
-                    if self._ensure_rcsp_ready():
-                        self._send_raw(protocol.build_set_eq_preset(self._mark_write_seq(), preset))
-                        if preset == "custom":
-                            time.sleep(0.03)
-                            self._send_raw(protocol.build_set_eq_curve(self._mark_write_seq(), bands))
-                        self._touch_write_ts()
+                    self._send_raw(protocol.build_set_eq_preset(self._mark_write_seq(), preset))
+                    if preset == "custom":
+                        time.sleep(0.03)
+                        self._send_raw(protocol.build_set_eq_curve(self._mark_write_seq(), bands))
+                    self._touch_write_ts()
                     self._persist_state()
             return self._snapshot_state()
 
@@ -1390,28 +1827,31 @@ class RedmiNeoDaemon:
             if isinstance(raw_bands, list) and len(raw_bands) == 10:
                 bands = [max(protocol.EQ_GAIN_MIN, min(protocol.EQ_GAIN_MAX, int(round(float(x))))) for x in raw_bands]
                 with self._write_lock:
+                    if not self._require_rcsp_for_write():
+                        return self._snapshot_state()
                     with self._lock:
                         self._begin_write()
                         self.state["eq_bands"] = bands
                         self.state["eq"] = "custom"
                         self.state["error"] = None
-                    if self._ensure_rcsp_ready():
-                        self._send_raw(protocol.build_set_eq_preset(self._mark_write_seq(), "custom"))
-                        time.sleep(0.02)
-                        self._send_raw(protocol.build_set_eq_curve(self._mark_write_seq(), bands))
-                        self._touch_write_ts()
+                    self._send_raw(protocol.build_set_eq_preset(self._mark_write_seq(), "custom"))
+                    time.sleep(0.02)
+                    self._send_raw(protocol.build_set_eq_curve(self._mark_write_seq(), bands))
+                    self._touch_write_ts()
                     self._persist_state()
             return self._snapshot_state()
 
         if cmd == "eq-reset":
             bands = [0] * 10
             with self._write_lock:
+                if not self._require_rcsp_for_write():
+                    return self._snapshot_state()
                 with self._lock:
                     self._begin_write()
                     is_custom = self.state.get("eq") == "custom"
                     self.state["eq_bands"] = bands
                     self.state["error"] = None
-                if self._ensure_rcsp_ready() and not self._rfcomm_is_fastpair:
+                if not self._rfcomm_is_fastpair:
                     self._send_raw(protocol.build_eq_reset(self._mark_write_seq()))
                     if is_custom:
                         time.sleep(0.03)
@@ -1423,68 +1863,73 @@ class RedmiNeoDaemon:
         if cmd == "multipoint":
             enabled = bool(req.get("enabled"))
             with self._write_lock:
+                if not self._require_rcsp_for_write():
+                    return self._snapshot_state()
                 with self._lock:
                     self._begin_write()
                     self.state["multipoint"] = enabled
                     self.state["error"] = None
-                if self._ensure_rcsp_ready():
-                    self._send_raw(protocol.build_set_multipoint(self._mark_write_seq(), enabled))
-                    self._touch_write_ts()
+                self._send_raw(protocol.build_set_multipoint(self._mark_write_seq(), enabled))
+                self._touch_write_ts()
                 self._persist_state()
             return self._snapshot_state()
 
         if cmd == "game-mode":
             enabled = bool(req.get("enabled"))
             with self._write_lock:
+                if not self._require_rcsp_for_write():
+                    return self._snapshot_state()
                 with self._lock:
                     self._begin_write()
                     self.state["game_mode"] = enabled
                     self.state["error"] = None
-                if self._ensure_rcsp_ready():
-                    self._send_raw(protocol.build_set_game_mode(self._mark_write_seq(), enabled))
-                    self._touch_write_ts()
+                self._send_raw(protocol.build_set_game_mode(self._mark_write_seq(), enabled))
+                self._touch_write_ts()
                 self._persist_state()
             return self._snapshot_state()
 
         if cmd == "auto-answer":
             enabled = bool(req.get("enabled"))
             with self._write_lock:
+                if not self._require_rcsp_for_write():
+                    return self._snapshot_state()
                 with self._lock:
                     self._begin_write()
                     self.state["auto_answer"] = enabled
                     self.state["error"] = None
-                if self._ensure_rcsp_ready():
-                    self._send_raw(protocol.build_set_auto_answer(self._mark_write_seq(), enabled))
-                    self._touch_write_ts()
+                self._send_raw(protocol.build_set_auto_answer(self._mark_write_seq(), enabled))
+                self._touch_write_ts()
                 self._persist_state()
             return self._snapshot_state()
 
         if cmd == "ear-detection":
             enabled = bool(req.get("enabled"))
             with self._write_lock:
+                if not self._require_rcsp_for_write():
+                    return self._snapshot_state()
                 with self._lock:
                     self._begin_write()
                     self.state["ear_detection"] = enabled
                     self.state["error"] = None
-                if self._ensure_rcsp_ready():
-                    self._send_raw(protocol.build_set_ear_detection(self._mark_write_seq(), enabled))
-                    self._touch_write_ts()
+                self._send_raw(protocol.build_set_ear_detection(self._mark_write_seq(), enabled))
+                self._touch_write_ts()
                 self._persist_state()
             return self._snapshot_state()
 
         if cmd == "find":
             enabled = bool(req.get("enabled"))
             with self._write_lock:
+                if not self._require_rcsp_for_write():
+                    return self._snapshot_state()
                 with self._lock:
                     self._begin_write()
                     self.state["finding"] = enabled
                     self.state["error"] = None
-                if self._ensure_rcsp_ready():
-                    if self._rfcomm_is_fastpair:
-                        self._send_raw(protocol.build_fastpair_ring(enabled))
-                    else:
-                        self._send_raw(protocol.build_set_find_device(self._mark_write_seq(), enabled))
-                    self._touch_write_ts()
+                if self._rfcomm_is_fastpair:
+                    self._send_raw(protocol.build_fastpair_ring(enabled))
+                else:
+                    self._send_raw(protocol.build_set_find_device(self._mark_write_seq(), enabled))
+                self._touch_write_ts()
             return self._snapshot_state()
 
         if cmd == "gesture":
@@ -1492,15 +1937,16 @@ class RedmiNeoDaemon:
             action = str(req.get("action") or "").lower()
             if slot in protocol.GESTURE_SLOT_TO_BYTE and action in protocol.GESTURE_ACTION_TO_BYTE:
                 with self._write_lock:
+                    if not self._require_rcsp_for_write():
+                        return self._snapshot_state()
                     with self._lock:
                         self._begin_write()
                         gestures = dict(self.state.get("gestures") or DEFAULT_GESTURES)
                         gestures[slot] = action
                         self.state["gestures"] = gestures
                         self.state["error"] = None
-                    if self._ensure_rcsp_ready():
-                        self._send_raw(protocol.build_set_gesture(self._mark_write_seq(), slot, action))
-                        self._touch_write_ts()
+                    self._send_raw(protocol.build_set_gesture(self._mark_write_seq(), slot, action))
+                    self._touch_write_ts()
                     self._persist_state()
             return self._snapshot_state()
 
@@ -1508,14 +1954,79 @@ class RedmiNeoDaemon:
             cycle_mode = str(req.get("mode") or "").lower()
             if cycle_mode in protocol.ANC_CYCLE_TO_BYTE:
                 with self._write_lock:
+                    if not self._require_rcsp_for_write():
+                        return self._snapshot_state()
                     with self._lock:
                         self._begin_write()
                         self.state["anc_cycle"] = cycle_mode
                         self.state["error"] = None
-                    if self._ensure_rcsp_ready():
-                        self._send_raw(protocol.build_set_anc_cycle(self._mark_write_seq(), cycle_mode))
-                        self._touch_write_ts()
+                    self._send_raw(protocol.build_set_anc_cycle(self._mark_write_seq(), cycle_mode))
+                    self._touch_write_ts()
                     self._persist_state()
+            return self._snapshot_state()
+
+        if cmd == "usb-volume":
+            with self._lock:
+                sink = self.state.get("usb_sink_name")
+            if sink and "volume" in req:
+                pct = max(0, min(100, int(round(float(req["volume"])))))
+                try:
+                    proc = subprocess.run(
+                        ["pactl", "set-sink-volume", str(sink), f"{pct}%"],
+                        capture_output=True,
+                        text=True,
+                        timeout=1.5,
+                        check=False,
+                    )
+                    if proc.returncode == 0:
+                        with self._lock:
+                            self.state["usb_volume"] = pct
+                            self.state["error"] = None
+                except Exception:
+                    pass
+            return self._snapshot_state()
+
+        if cmd == "usb-mute":
+            with self._lock:
+                sink = self.state.get("usb_sink_name")
+                cur_muted = bool(self.state.get("usb_muted", False))
+            if sink:
+                val = req.get("muted")
+                arg = ("1" if bool(val) else "0") if val is not None else "toggle"
+                try:
+                    proc = subprocess.run(
+                        ["pactl", "set-sink-mute", str(sink), arg],
+                        capture_output=True,
+                        text=True,
+                        timeout=1.5,
+                        check=False,
+                    )
+                    if proc.returncode == 0:
+                        with self._lock:
+                            self.state["usb_muted"] = (not cur_muted) if val is None else bool(val)
+                            self.state["error"] = None
+                except Exception:
+                    pass
+            return self._snapshot_state()
+
+        if cmd == "usb-set-default":
+            with self._lock:
+                sink = self.state.get("usb_sink_name")
+            if sink:
+                try:
+                    proc = subprocess.run(
+                        ["pactl", "set-default-sink", str(sink)],
+                        capture_output=True,
+                        text=True,
+                        timeout=1.5,
+                        check=False,
+                    )
+                    if proc.returncode == 0:
+                        with self._lock:
+                            self.state["usb_default_audio"] = True
+                            self.state["error"] = None
+                except Exception:
+                    pass
             return self._snapshot_state()
 
         if cmd == "quit":
